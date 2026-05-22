@@ -12,6 +12,10 @@ pub enum CrebroError {
     Secret(String),
     #[error("redaction error: {0}")]
     Redaction(String),
+    #[error(
+        "unregistered credential-like value matched pattern `{pattern_id}`; wrap it with <cb>...</cb> or register it through env/.env"
+    )]
+    UnregisteredCredential { pattern_id: String },
     #[error("restore error: {0}")]
     Restore(String),
     #[error("gateway error: {0}")]

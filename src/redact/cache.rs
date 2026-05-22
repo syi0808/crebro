@@ -1,6 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 
-use crate::{Result, secrets::SecretRegistry};
+use crate::{
+    Result,
+    secrets::{SecretId, SecretRegistry},
+};
 
 use super::{
     scanner::scan_string_token,
@@ -11,7 +14,11 @@ use super::{
 pub enum CacheEntry {
     NoSecret,
     Spans(Vec<RedactionSpan>),
-    Sanitized(Vec<u8>),
+    Sanitized {
+        bytes: Vec<u8>,
+        redacted_secret_ids: Vec<SecretId>,
+        unregistered_pattern_ids: Vec<String>,
+    },
 }
 
 impl std::fmt::Debug for CacheEntry {
@@ -22,12 +29,34 @@ impl std::fmt::Debug for CacheEntry {
                 .debug_struct("Spans")
                 .field("count", &spans.len())
                 .finish_non_exhaustive(),
-            Self::Sanitized(bytes) => f
+            Self::Sanitized {
+                bytes,
+                redacted_secret_ids,
+                unregistered_pattern_ids,
+            } => f
                 .debug_struct("Sanitized")
                 .field("bytes_len", &bytes.len())
+                .field("redaction_count", &redacted_secret_ids.len())
+                .field(
+                    "unregistered_pattern_count",
+                    &unregistered_pattern_ids.len(),
+                )
                 .finish_non_exhaustive(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SanitizedString {
+    pub bytes: Vec<u8>,
+    pub redacted_secret_ids: Vec<SecretId>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SanitizedObject {
+    pub bytes: Vec<u8>,
+    pub redacted_secret_ids: Vec<SecretId>,
+    pub unregistered_pattern_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -96,18 +125,32 @@ impl RedactionCache {
     }
 
     pub fn sanitize_string(&mut self, bytes: &[u8], registry: &SecretRegistry) -> Result<Vec<u8>> {
+        Ok(self.sanitize_string_detailed(bytes, registry)?.bytes)
+    }
+
+    pub fn sanitize_string_detailed(
+        &mut self,
+        bytes: &[u8],
+        registry: &SecretRegistry,
+    ) -> Result<SanitizedString> {
         if registry.is_empty() {
-            return Ok(bytes.to_vec());
+            return Ok(SanitizedString {
+                bytes: bytes.to_vec(),
+                redacted_secret_ids: Vec::new(),
+            });
         }
         if registry
             .min_secret_len()
             .is_some_and(|min_len| bytes.len() < min_len)
         {
-            return Ok(bytes.to_vec());
+            return Ok(SanitizedString {
+                bytes: bytes.to_vec(),
+                redacted_secret_ids: Vec::new(),
+            });
         }
 
         if bytes.len() > self.chunk_size {
-            return self.sanitize_large_string(bytes, registry);
+            return self.sanitize_large_string_detailed(bytes, registry);
         }
 
         self.sync_registry_version(registry);
@@ -115,9 +158,22 @@ impl RedactionCache {
         if let Some(entry) = self.cached_entry(&key) {
             self.stats.hits += 1;
             return match entry {
-                CacheEntry::NoSecret => Ok(bytes.to_vec()),
-                CacheEntry::Spans(spans) => Ok(apply_spans(bytes, &spans)),
-                CacheEntry::Sanitized(sanitized) => Ok(sanitized.clone()),
+                CacheEntry::NoSecret => Ok(SanitizedString {
+                    bytes: bytes.to_vec(),
+                    redacted_secret_ids: Vec::new(),
+                }),
+                CacheEntry::Spans(spans) => Ok(SanitizedString {
+                    bytes: apply_spans(bytes, &spans),
+                    redacted_secret_ids: secret_ids_from_spans(&spans),
+                }),
+                CacheEntry::Sanitized {
+                    bytes,
+                    redacted_secret_ids,
+                    ..
+                } => Ok(SanitizedString {
+                    bytes,
+                    redacted_secret_ids,
+                }),
             };
         }
 
@@ -125,20 +181,24 @@ impl RedactionCache {
         self.stats.scanner_runs += 1;
         let spans = scan_string_token(bytes, registry)?;
         let out = apply_spans(bytes, &spans);
+        let redacted_secret_ids = secret_ids_from_spans(&spans);
         let entry = if spans.is_empty() {
             CacheEntry::NoSecret
         } else {
             CacheEntry::Spans(spans)
         };
         self.insert(key, entry);
-        Ok(out)
+        Ok(SanitizedString {
+            bytes: out,
+            redacted_secret_ids,
+        })
     }
 
-    fn sanitize_large_string(
+    fn sanitize_large_string_detailed(
         &mut self,
         bytes: &[u8],
         registry: &SecretRegistry,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<SanitizedString> {
         self.sync_registry_version(registry);
         let overlap = registry.max_secret_len().saturating_sub(1);
         let mut global_spans = Vec::new();
@@ -158,7 +218,11 @@ impl RedactionCache {
             start = base_end;
         }
         let global_spans = select_longest_non_overlapping(global_spans);
-        Ok(apply_spans(bytes, &global_spans))
+        let redacted_secret_ids = secret_ids_from_spans(&global_spans);
+        Ok(SanitizedString {
+            bytes: apply_spans(bytes, &global_spans),
+            redacted_secret_ids,
+        })
     }
 
     fn spans_for_window(
@@ -177,7 +241,7 @@ impl RedactionCache {
                     self.stats.hits += 1;
                     return Ok(spans.clone());
                 }
-                CacheEntry::Sanitized(_) => {}
+                CacheEntry::Sanitized { .. } => {}
             }
         }
 
@@ -197,14 +261,23 @@ impl RedactionCache {
         &mut self,
         canonical_bytes: &[u8],
         registry: &mut SecretRegistry,
-        sanitized_bytes: impl FnOnce(&mut Self, &mut SecretRegistry) -> Result<Vec<u8>>,
-    ) -> Result<Vec<u8>> {
+        sanitized_bytes: impl FnOnce(&mut Self, &mut SecretRegistry) -> Result<SanitizedObject>,
+    ) -> Result<SanitizedObject> {
         self.sync_registry_version(registry);
         let version_before = registry.version();
         let key = registry.cache_key(canonical_bytes)?;
-        if let Some(CacheEntry::Sanitized(sanitized)) = self.cached_entry(&key) {
+        if let Some(CacheEntry::Sanitized {
+            bytes,
+            redacted_secret_ids,
+            unregistered_pattern_ids,
+        }) = self.cached_entry(&key)
+        {
             self.stats.hits += 1;
-            return Ok(sanitized.clone());
+            return Ok(SanitizedObject {
+                bytes,
+                redacted_secret_ids,
+                unregistered_pattern_ids,
+            });
         }
         self.stats.misses += 1;
         let sanitized = sanitized_bytes(self, registry)?;
@@ -212,7 +285,14 @@ impl RedactionCache {
             self.flush(registry.version());
             return Ok(sanitized);
         }
-        self.insert(key, CacheEntry::Sanitized(sanitized.clone()));
+        self.insert(
+            key,
+            CacheEntry::Sanitized {
+                bytes: sanitized.bytes.clone(),
+                redacted_secret_ids: sanitized.redacted_secret_ids.clone(),
+                unregistered_pattern_ids: sanitized.unregistered_pattern_ids.clone(),
+            },
+        );
         Ok(sanitized)
     }
 
@@ -244,4 +324,8 @@ impl RedactionCache {
     fn touch(&mut self, key: &[u8; 32]) {
         self.order.retain(|entry| entry != key);
     }
+}
+
+fn secret_ids_from_spans(spans: &[RedactionSpan]) -> Vec<SecretId> {
+    spans.iter().map(|span| span.secret_id).collect()
 }

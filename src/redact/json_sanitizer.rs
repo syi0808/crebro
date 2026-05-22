@@ -1,10 +1,16 @@
+use std::sync::Arc;
+
 use bytes::Bytes;
 use serde_json::Value;
 
-use crate::{CrebroError, Result, secrets::SecretRegistry};
+use crate::{
+    CrebroError, Result,
+    patterns::{CredentialPatternSet, OnUnregisteredMatch},
+    secrets::{SecretId, SecretRegistry},
+};
 
 use super::{
-    cache::{RedactionCache, RedactionCacheStats},
+    cache::{RedactionCache, RedactionCacheStats, SanitizedObject},
     directive::{DirectivePart, might_contain_directive_bytes, parse_user_secret_directives},
     field_policy::{FieldAction, FieldPolicy},
 };
@@ -14,12 +20,15 @@ pub struct SanitizerReport {
     pub input_bytes: usize,
     pub output_bytes: usize,
     pub cache_stats: RedactionCacheStats,
+    pub redacted_secret_ids: Vec<SecretId>,
+    pub unregistered_pattern_ids: Vec<String>,
 }
 
 #[derive(Debug)]
 pub struct JsonSanitizer {
     cache: RedactionCache,
     field_policy: FieldPolicy,
+    patterns: Arc<CredentialPatternSet>,
 }
 
 #[derive(Default)]
@@ -29,6 +38,8 @@ pub struct StreamingJsonState {
     raw_string: Vec<u8>,
     input_bytes: usize,
     output_bytes: usize,
+    redacted_secret_ids: Vec<SecretId>,
+    unregistered_pattern_ids: Vec<String>,
     path: Vec<String>,
     stack: Vec<StreamingFrame>,
 }
@@ -41,6 +52,11 @@ impl std::fmt::Debug for StreamingJsonState {
             .field("raw_string_len", &self.raw_string.len())
             .field("input_bytes", &self.input_bytes)
             .field("output_bytes", &self.output_bytes)
+            .field("redaction_count", &self.redacted_secret_ids.len())
+            .field(
+                "unregistered_pattern_count",
+                &self.unregistered_pattern_ids.len(),
+            )
             .field("path_depth", &self.path.len())
             .field("stack_depth", &self.stack.len())
             .finish_non_exhaustive()
@@ -70,9 +86,14 @@ enum StreamingStringContext {
 
 impl JsonSanitizer {
     pub fn new(max_cache_entries: usize) -> Self {
+        Self::with_patterns(max_cache_entries, CredentialPatternSet::builtin())
+    }
+
+    pub fn with_patterns(max_cache_entries: usize, patterns: Arc<CredentialPatternSet>) -> Self {
         Self {
             cache: RedactionCache::new(max_cache_entries),
             field_policy: FieldPolicy,
+            patterns,
         }
     }
 
@@ -85,28 +106,35 @@ impl JsonSanitizer {
         body: &[u8],
         registry: &mut SecretRegistry,
     ) -> Result<(Vec<u8>, SanitizerReport)> {
-        if registry.is_empty() && !might_contain_directive_bytes(body) {
+        if registry.is_empty()
+            && !self.patterns.has_credential_patterns()
+            && !might_contain_directive_bytes(body)
+        {
             return Ok((
                 body.to_vec(),
                 SanitizerReport {
                     input_bytes: body.len(),
                     output_bytes: body.len(),
                     cache_stats: self.cache.stats(),
+                    redacted_secret_ids: Vec::new(),
+                    unregistered_pattern_ids: Vec::new(),
                 },
             ));
         }
 
         let mut value: Value = serde_json::from_slice(body)?;
-        self.sanitize_value(&mut value, registry, &mut Vec::new())?;
+        let mut report = SanitizerReport {
+            input_bytes: body.len(),
+            output_bytes: 0,
+            cache_stats: self.cache.stats(),
+            redacted_secret_ids: Vec::new(),
+            unregistered_pattern_ids: Vec::new(),
+        };
+        self.sanitize_value(&mut value, registry, &mut Vec::new(), &mut report)?;
         let out = serde_json::to_vec(&value)?;
-        Ok((
-            out.clone(),
-            SanitizerReport {
-                input_bytes: body.len(),
-                output_bytes: out.len(),
-                cache_stats: self.cache.stats(),
-            },
-        ))
+        report.output_bytes = out.len();
+        report.cache_stats = self.cache.stats();
+        Ok((out.clone(), report))
     }
 
     pub fn streaming_state(&self) -> StreamingJsonState {
@@ -134,9 +162,14 @@ impl JsonSanitizer {
                     let context = state.complete_string_context(&raw_string)?;
                     let sanitized = match context {
                         StreamingStringContext::ObjectKey => quote_raw_json_string(&raw_string),
-                        StreamingStringContext::Value { path } => {
-                            self.sanitize_streaming_raw_json_string(&raw_string, &path, registry)?
-                        }
+                        StreamingStringContext::Value { path } => self
+                            .sanitize_streaming_raw_json_string(
+                                &raw_string,
+                                &path,
+                                registry,
+                                &mut state.redacted_secret_ids,
+                                &mut state.unregistered_pattern_ids,
+                            )?,
                     };
                     out.extend_from_slice(&sanitized);
                     state.in_string = false;
@@ -172,6 +205,8 @@ impl JsonSanitizer {
                 input_bytes: state.input_bytes,
                 output_bytes: state.output_bytes,
                 cache_stats: self.cache.stats(),
+                redacted_secret_ids: state.redacted_secret_ids,
+                unregistered_pattern_ids: state.unregistered_pattern_ids,
             },
         ))
     }
@@ -180,9 +215,16 @@ impl JsonSanitizer {
         &mut self,
         raw_string: &[u8],
         registry: &mut SecretRegistry,
+        redacted_secret_ids: &mut Vec<SecretId>,
+        unregistered_pattern_ids: &mut Vec<String>,
     ) -> Result<Vec<u8>> {
         let decoded = decode_raw_json_string(raw_string)?;
-        self.sanitize_decoded_json_string(decoded, registry)
+        self.sanitize_decoded_json_string(
+            decoded,
+            registry,
+            redacted_secret_ids,
+            unregistered_pattern_ids,
+        )
     }
 
     fn sanitize_streaming_raw_json_string(
@@ -190,29 +232,46 @@ impl JsonSanitizer {
         raw_string: &[u8],
         path: &[String],
         registry: &mut SecretRegistry,
+        redacted_secret_ids: &mut Vec<SecretId>,
+        unregistered_pattern_ids: &mut Vec<String>,
     ) -> Result<Vec<u8>> {
         if self.field_policy.action_for_path(path) == FieldAction::SkipKnownBinary {
             if !might_contain_directive_bytes(raw_string) {
                 return Ok(quote_raw_json_string(raw_string));
             }
             let decoded = decode_raw_json_string(raw_string)?;
-            return match replace_user_secret_directives(&decoded, registry)? {
-                Some(sanitized) => serde_json::to_vec(&sanitized).map_err(Into::into),
+            return match replace_user_secret_directives(&decoded, registry, redacted_secret_ids)? {
+                Some(sanitized) => serde_json::to_vec(&sanitized.text).map_err(Into::into),
                 None => Ok(quote_raw_json_string(raw_string)),
             };
         }
-        if registry.is_empty() && !might_contain_directive_bytes(raw_string) {
+        if registry.is_empty()
+            && !self.patterns.has_credential_patterns()
+            && !might_contain_directive_bytes(raw_string)
+        {
             return Ok(quote_raw_json_string(raw_string));
         }
-        self.sanitize_raw_json_string(raw_string, registry)
+        self.sanitize_raw_json_string(
+            raw_string,
+            registry,
+            redacted_secret_ids,
+            unregistered_pattern_ids,
+        )
     }
 
     fn sanitize_decoded_json_string(
         &mut self,
         decoded: String,
         registry: &mut SecretRegistry,
+        redacted_secret_ids: &mut Vec<SecretId>,
+        unregistered_pattern_ids: &mut Vec<String>,
     ) -> Result<Vec<u8>> {
-        let sanitized = self.sanitize_decoded_string(&decoded, registry)?;
+        let sanitized = self.sanitize_decoded_string(
+            &decoded,
+            registry,
+            redacted_secret_ids,
+            unregistered_pattern_ids,
+        )?;
         serde_json::to_vec(&sanitized).map_err(Into::into)
     }
 
@@ -220,22 +279,40 @@ impl JsonSanitizer {
         &mut self,
         decoded: &str,
         registry: &mut SecretRegistry,
+        redacted_secret_ids: &mut Vec<SecretId>,
+        unregistered_pattern_ids: &mut Vec<String>,
     ) -> Result<String> {
         if let Some(sanitized) =
             replace_user_secret_directives_with(decoded, registry, |text, registry| {
-                self.cache.sanitize_string(text.as_bytes(), registry)
+                let sanitized = self
+                    .cache
+                    .sanitize_string_detailed(text.as_bytes(), registry)?;
+                redacted_secret_ids.extend(sanitized.redacted_secret_ids.iter().copied());
+                Ok(sanitized.bytes)
             })?
         {
-            return Ok(sanitized);
+            redacted_secret_ids.extend(sanitized.secret_ids.iter().copied());
+            let pattern_ids = self.inspect_unregistered_patterns(&sanitized.text)?;
+            unregistered_pattern_ids.extend(pattern_ids);
+            return Ok(sanitized.text);
         }
 
         if registry.is_empty() {
+            let pattern_ids = self.inspect_unregistered_patterns(decoded)?;
+            unregistered_pattern_ids.extend(pattern_ids);
             return Ok(decoded.to_string());
         }
 
-        let sanitized = self.cache.sanitize_string(decoded.as_bytes(), registry)?;
-        String::from_utf8(sanitized)
-            .map_err(|_| CrebroError::Redaction("sanitized JSON string is not valid UTF-8".into()))
+        let sanitized = self
+            .cache
+            .sanitize_string_detailed(decoded.as_bytes(), registry)?;
+        redacted_secret_ids.extend(sanitized.redacted_secret_ids.iter().copied());
+        let text = String::from_utf8(sanitized.bytes).map_err(|_| {
+            CrebroError::Redaction("sanitized JSON string is not valid UTF-8".into())
+        })?;
+        let pattern_ids = self.inspect_unregistered_patterns(&text)?;
+        unregistered_pattern_ids.extend(pattern_ids);
+        Ok(text)
     }
 
     fn sanitize_value(
@@ -243,23 +320,33 @@ impl JsonSanitizer {
         value: &mut Value,
         registry: &mut SecretRegistry,
         path: &mut Vec<String>,
+        report: &mut SanitizerReport,
     ) -> Result<()> {
         match value {
             Value::String(s) => {
                 if self.field_policy.action_for_path(path) == FieldAction::SkipKnownBinary {
-                    if let Some(sanitized) = replace_user_secret_directives(s, registry)? {
-                        *s = sanitized;
+                    if let Some(sanitized) = replace_user_secret_directives(
+                        s,
+                        registry,
+                        &mut report.redacted_secret_ids,
+                    )? {
+                        *s = sanitized.text;
                     }
                     return Ok(());
                 }
-                let sanitized = self.sanitize_decoded_string(s, registry)?;
+                let sanitized = self.sanitize_decoded_string(
+                    s,
+                    registry,
+                    &mut report.redacted_secret_ids,
+                    &mut report.unregistered_pattern_ids,
+                )?;
                 if sanitized != *s {
                     *s = sanitized;
                 }
             }
             Value::Array(items) => {
                 for item in items {
-                    self.sanitize_value(item, registry, path)?;
+                    self.sanitize_value(item, registry, path, report)?;
                 }
             }
             Value::Object(map) => {
@@ -277,29 +364,58 @@ impl JsonSanitizer {
                         registry,
                         |cache, registry| {
                             let mut object_value = Value::Object(map.clone());
+                            let mut object_report = SanitizerReport::default();
                             sanitize_value_with_cache(
                                 &mut object_value,
                                 registry,
                                 path,
                                 cache,
                                 &self.field_policy,
+                                &self.patterns,
+                                &mut object_report,
                             )?;
-                            serde_json::to_vec(&object_value).map_err(Into::into)
+                            Ok(SanitizedObject {
+                                bytes: serde_json::to_vec(&object_value)?,
+                                redacted_secret_ids: object_report.redacted_secret_ids,
+                                unregistered_pattern_ids: object_report.unregistered_pattern_ids,
+                            })
                         },
                     )?;
-                    *value = serde_json::from_slice(&sanitized)?;
+                    report
+                        .redacted_secret_ids
+                        .extend(sanitized.redacted_secret_ids.iter().copied());
+                    report
+                        .unregistered_pattern_ids
+                        .extend(sanitized.unregistered_pattern_ids.iter().cloned());
+                    *value = serde_json::from_slice(&sanitized.bytes)?;
                     return Ok(());
                 }
 
                 for (key, child) in map.iter_mut() {
                     path.push(key.clone());
-                    self.sanitize_value(child, registry, path)?;
+                    self.sanitize_value(child, registry, path, report)?;
                     path.pop();
                 }
             }
             Value::Null | Value::Bool(_) | Value::Number(_) => {}
         }
         Ok(())
+    }
+
+    fn inspect_unregistered_patterns(&self, text: &str) -> Result<Vec<String>> {
+        let matches = self.patterns.inspect_unregistered_text(text);
+        let mut allowed = Vec::new();
+        for pattern_match in matches {
+            match pattern_match.on_unregistered_match {
+                OnUnregisteredMatch::RequireExplicitSecret => {
+                    return Err(CrebroError::UnregisteredCredential {
+                        pattern_id: pattern_match.id,
+                    });
+                }
+                OnUnregisteredMatch::Allow => allowed.push(pattern_match.id),
+            }
+        }
+        Ok(allowed)
     }
 }
 
@@ -309,29 +425,50 @@ fn sanitize_value_with_cache(
     path: &mut Vec<String>,
     cache: &mut RedactionCache,
     field_policy: &FieldPolicy,
+    patterns: &CredentialPatternSet,
+    report: &mut SanitizerReport,
 ) -> Result<()> {
     match value {
         Value::String(s) => {
             if field_policy.action_for_path(path) == FieldAction::SkipKnownBinary {
-                if let Some(sanitized) = replace_user_secret_directives(s, registry)? {
-                    *s = sanitized;
+                if let Some(sanitized) =
+                    replace_user_secret_directives(s, registry, &mut report.redacted_secret_ids)?
+                {
+                    *s = sanitized.text;
                 }
                 return Ok(());
             }
-            let sanitized = sanitize_decoded_string_with_cache(s, registry, cache)?;
+            let sanitized =
+                sanitize_decoded_string_with_cache(s, registry, cache, patterns, report)?;
             if sanitized != *s {
                 *s = sanitized;
             }
         }
         Value::Array(items) => {
             for item in items {
-                sanitize_value_with_cache(item, registry, path, cache, field_policy)?;
+                sanitize_value_with_cache(
+                    item,
+                    registry,
+                    path,
+                    cache,
+                    field_policy,
+                    patterns,
+                    report,
+                )?;
             }
         }
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
                 path.push(key.clone());
-                sanitize_value_with_cache(child, registry, path, cache, field_policy)?;
+                sanitize_value_with_cache(
+                    child,
+                    registry,
+                    path,
+                    cache,
+                    field_policy,
+                    patterns,
+                    report,
+                )?;
                 path.pop();
             }
         }
@@ -344,57 +481,106 @@ fn sanitize_decoded_string_with_cache(
     decoded: &str,
     registry: &mut SecretRegistry,
     cache: &mut RedactionCache,
+    patterns: &CredentialPatternSet,
+    report: &mut SanitizerReport,
 ) -> Result<String> {
     if let Some(sanitized) =
         replace_user_secret_directives_with(decoded, registry, |text, registry| {
-            cache.sanitize_string(text.as_bytes(), registry)
+            let sanitized = cache.sanitize_string_detailed(text.as_bytes(), registry)?;
+            report
+                .redacted_secret_ids
+                .extend(sanitized.redacted_secret_ids.iter().copied());
+            Ok(sanitized.bytes)
         })?
     {
-        return Ok(sanitized);
+        report.redacted_secret_ids.extend(sanitized.secret_ids);
+        inspect_patterns(patterns, &sanitized.text, report)?;
+        return Ok(sanitized.text);
     }
 
     if registry.is_empty() {
+        inspect_patterns(patterns, decoded, report)?;
         return Ok(decoded.to_string());
     }
 
-    let sanitized = cache.sanitize_string(decoded.as_bytes(), registry)?;
-    String::from_utf8(sanitized)
-        .map_err(|_| CrebroError::Redaction("sanitized JSON string is not valid UTF-8".into()))
+    let sanitized = cache.sanitize_string_detailed(decoded.as_bytes(), registry)?;
+    report
+        .redacted_secret_ids
+        .extend(sanitized.redacted_secret_ids.iter().copied());
+    let text = String::from_utf8(sanitized.bytes)
+        .map_err(|_| CrebroError::Redaction("sanitized JSON string is not valid UTF-8".into()))?;
+    inspect_patterns(patterns, &text, report)?;
+    Ok(text)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectiveText {
+    text: String,
+    secret_ids: Vec<SecretId>,
 }
 
 fn replace_user_secret_directives(
     decoded: &str,
     registry: &mut SecretRegistry,
-) -> Result<Option<String>> {
-    replace_user_secret_directives_with(decoded, registry, |text, _registry| {
+    redacted_secret_ids: &mut Vec<SecretId>,
+) -> Result<Option<DirectiveText>> {
+    let replacement = replace_user_secret_directives_with(decoded, registry, |text, _registry| {
         Ok(text.as_bytes().to_vec())
-    })
+    })?;
+    if let Some(directive_text) = &replacement {
+        redacted_secret_ids.extend(directive_text.secret_ids.iter().copied());
+    }
+    Ok(replacement)
 }
 
 fn replace_user_secret_directives_with(
     decoded: &str,
     registry: &mut SecretRegistry,
     mut sanitize_plain: impl FnMut(&str, &mut SecretRegistry) -> Result<Vec<u8>>,
-) -> Result<Option<String>> {
+) -> Result<Option<DirectiveText>> {
     let Some(replacement) = parse_user_secret_directives(decoded, registry)? else {
         return Ok(None);
     };
 
     let mut out = Vec::with_capacity(decoded.len());
+    let mut secret_ids = Vec::new();
     for part in replacement.parts {
         match part {
             DirectivePart::Plain(text) => {
                 out.extend(sanitize_plain(text, registry)?);
             }
-            DirectivePart::Placeholder(placeholder) => {
+            DirectivePart::Secret {
+                placeholder,
+                secret_id,
+            } => {
                 out.extend_from_slice(placeholder.as_bytes());
+                secret_ids.push(secret_id);
             }
         }
     }
 
-    String::from_utf8(out)
-        .map(Some)
-        .map_err(|_| CrebroError::Redaction("sanitized directive string is not valid UTF-8".into()))
+    let text = String::from_utf8(out).map_err(|_| {
+        CrebroError::Redaction("sanitized directive string is not valid UTF-8".into())
+    })?;
+    Ok(Some(DirectiveText { text, secret_ids }))
+}
+
+fn inspect_patterns(
+    patterns: &CredentialPatternSet,
+    text: &str,
+    report: &mut SanitizerReport,
+) -> Result<()> {
+    for pattern_match in patterns.inspect_unregistered_text(text) {
+        match pattern_match.on_unregistered_match {
+            OnUnregisteredMatch::RequireExplicitSecret => {
+                return Err(CrebroError::UnregisteredCredential {
+                    pattern_id: pattern_match.id,
+                });
+            }
+            OnUnregisteredMatch::Allow => report.unregistered_pattern_ids.push(pattern_match.id),
+        }
+    }
+    Ok(())
 }
 
 fn is_cacheable_object_path(path: &[String]) -> bool {

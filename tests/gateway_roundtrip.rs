@@ -1,6 +1,7 @@
 use std::{
     convert::Infallible,
     io::Write,
+    path::PathBuf,
     process::Stdio,
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
@@ -25,6 +26,17 @@ use tokio::{
     net::TcpListener,
     sync::{Mutex, RwLock, oneshot},
 };
+
+fn unique_temp_dir(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "crebro-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
 
 #[derive(Clone)]
 struct MockState {
@@ -302,6 +314,7 @@ async fn gateway_redacts_before_upstream_and_restores_response() {
             provider_auth_secret: Some(secret_id),
             cache_entries: 64,
             streaming_json_threshold_bytes: 256 * 1024,
+            ..GatewayConfig::default()
         },
         Arc::new(RwLock::new(registry)),
     )
@@ -349,6 +362,7 @@ async fn gateway_redacts_user_declared_secret_before_upstream() {
             provider_auth_secret: None,
             cache_entries: 64,
             streaming_json_threshold_bytes: 256 * 1024,
+            ..GatewayConfig::default()
         },
         Arc::new(RwLock::new(registry)),
     )
@@ -387,6 +401,7 @@ async fn gateway_rejects_malformed_user_secret_directive() {
             provider_auth_secret: None,
             cache_entries: 64,
             streaming_json_threshold_bytes: 256 * 1024,
+            ..GatewayConfig::default()
         },
         Arc::new(RwLock::new(registry)),
     )
@@ -407,6 +422,85 @@ async fn gateway_rejects_malformed_user_secret_directive() {
 }
 
 #[tokio::test]
+async fn gateway_records_redaction_stats_without_raw_secret() {
+    let (registry, _, placeholder) = registry_with_secret();
+    let stats_dir = unique_temp_dir("redaction-stats");
+    let stats_path = stats_dir.join("stats.json");
+    let (upstream_url, _bodies, _) = spawn_mock_upstream(b"{}".to_vec()).await;
+    let gateway = spawn_gateway(
+        GatewayConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            upstream_base: upstream_url,
+            provider_auth_secret: None,
+            cache_entries: 64,
+            streaming_json_threshold_bytes: 256 * 1024,
+            stats_path: Some(stats_path.clone()),
+            ..GatewayConfig::default()
+        },
+        Arc::new(RwLock::new(registry)),
+    )
+    .await
+    .unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", gateway.url()))
+        .header("content-type", "application/json")
+        .body(r#"{"messages":[{"role":"user","content":"use sk-gateway-secret-1234567890"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let stats = std::fs::read_to_string(&stats_path).unwrap();
+    assert!(stats.contains(&placeholder));
+    assert!(stats.contains("OPENAI_API_KEY"));
+    assert!(stats.contains("\"count\": 1"));
+    assert!(!stats.contains("sk-gateway-secret-1234567890"));
+}
+
+#[tokio::test]
+async fn gateway_records_unregistered_pattern_stats_on_reject() {
+    let registry = SecretRegistry::with_generated_keys();
+    let stats_dir = unique_temp_dir("pattern-stats");
+    let stats_path = stats_dir.join("stats.json");
+    let (upstream_url, bodies, _) = spawn_mock_upstream(b"{}".to_vec()).await;
+    let gateway = spawn_gateway(
+        GatewayConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            upstream_base: upstream_url,
+            provider_auth_secret: None,
+            cache_entries: 64,
+            streaming_json_threshold_bytes: 256 * 1024,
+            stats_path: Some(stats_path.clone()),
+            ..GatewayConfig::default()
+        },
+        Arc::new(RwLock::new(registry)),
+    )
+    .await
+    .unwrap();
+
+    let secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+    let body = format!(r#"{{"messages":[{{"role":"user","content":"send {secret}"}}]}}"#);
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", gateway.url()))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(bodies.lock().await.is_empty());
+    let stats = std::fs::read_to_string(&stats_path).unwrap();
+    assert!(stats.contains("github_token"));
+    assert!(stats.contains("require_explicit_secret"));
+    assert!(stats.contains("\"count\": 1"));
+    assert!(!stats.contains(secret));
+}
+
+#[tokio::test]
 async fn gateway_sanitizes_json_content_type_case_insensitively() {
     let (registry, _, _) = registry_with_secret();
     let (upstream_url, bodies, _) = spawn_mock_upstream(b"{}".to_vec()).await;
@@ -417,6 +511,7 @@ async fn gateway_sanitizes_json_content_type_case_insensitively() {
             provider_auth_secret: None,
             cache_entries: 64,
             streaming_json_threshold_bytes: 256 * 1024,
+            ..GatewayConfig::default()
         },
         Arc::new(RwLock::new(registry)),
     )
@@ -450,6 +545,7 @@ async fn gateway_strips_stale_request_content_encoding_after_json_redaction() {
             provider_auth_secret: None,
             cache_entries: 64,
             streaming_json_threshold_bytes: 256 * 1024,
+            ..GatewayConfig::default()
         },
         Arc::new(RwLock::new(registry)),
     )
@@ -493,6 +589,7 @@ async fn gateway_registers_observed_auth_header_and_invalidates_redaction_cache(
             provider_auth_secret: None,
             cache_entries: 64,
             streaming_json_threshold_bytes: 256 * 1024,
+            ..GatewayConfig::default()
         },
         Arc::new(RwLock::new(registry)),
     )
@@ -538,6 +635,7 @@ async fn gateway_registers_observed_bearer_auth_case_insensitively() {
             provider_auth_secret: None,
             cache_entries: 64,
             streaming_json_threshold_bytes: 256 * 1024,
+            ..GatewayConfig::default()
         },
         Arc::new(RwLock::new(registry)),
     )
@@ -589,6 +687,7 @@ async fn gateway_restores_placeholder_split_across_upstream_chunks() {
             provider_auth_secret: None,
             cache_entries: 64,
             streaming_json_threshold_bytes: 256 * 1024,
+            ..GatewayConfig::default()
         },
         Arc::new(RwLock::new(registry)),
     )
@@ -629,6 +728,7 @@ async fn gateway_strips_content_encoding_after_response_restore() {
             provider_auth_secret: None,
             cache_entries: 64,
             streaming_json_threshold_bytes: 256 * 1024,
+            ..GatewayConfig::default()
         },
         Arc::new(RwLock::new(registry)),
     )
@@ -670,6 +770,7 @@ async fn gateway_streams_restored_response_before_upstream_finishes() {
             provider_auth_secret: None,
             cache_entries: 64,
             streaming_json_threshold_bytes: 256 * 1024,
+            ..GatewayConfig::default()
         },
         Arc::new(RwLock::new(registry)),
     )
@@ -738,6 +839,7 @@ async fn configured_auth_uses_provider_specific_headers() {
                 provider_auth_secret: Some(id),
                 cache_entries: 64,
                 streaming_json_threshold_bytes: 256 * 1024,
+                ..GatewayConfig::default()
             },
             Arc::new(RwLock::new(registry)),
         )
@@ -789,6 +891,7 @@ async fn configured_auth_uses_gemini_header_for_stable_gemini_routes() {
                 provider_auth_secret: Some(id),
                 cache_entries: 64,
                 streaming_json_threshold_bytes: 256 * 1024,
+                ..GatewayConfig::default()
             },
             Arc::new(RwLock::new(registry)),
         )
@@ -824,6 +927,8 @@ async fn cli_one_shot_wrapper_returns_child_exit_status() {
         upstream_url: Some(upstream_url),
         provider_api_key: None,
         env_file: std::env::temp_dir().join("crebro-test-missing.env"),
+        patterns_file: None,
+        stats_dir: Some(unique_temp_dir("cli-exit-stats")),
         command: vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -871,6 +976,8 @@ if secret not in body or "{{CREBRO_SECRET" in body:
         upstream_url: Some(upstream_url),
         provider_api_key: Some(secret.to_string()),
         env_file: std::env::temp_dir().join("crebro-test-missing.env"),
+        patterns_file: None,
+        stats_dir: Some(unique_temp_dir("cli-wrapper-stats")),
         command: vec!["python3".to_string(), "-c".to_string(), script],
     })
     .await
@@ -922,6 +1029,7 @@ async fn provider_schema_fixtures_redact_supported_payloads() {
             provider_auth_secret: None,
             cache_entries: 128,
             streaming_json_threshold_bytes: 256 * 1024,
+            ..GatewayConfig::default()
         },
         Arc::new(RwLock::new(registry)),
     )
@@ -1002,6 +1110,7 @@ async fn gateway_uses_streaming_redaction_for_large_json_body() {
             provider_auth_secret: None,
             cache_entries: 128,
             streaming_json_threshold_bytes: 1,
+            ..GatewayConfig::default()
         },
         Arc::new(RwLock::new(registry)),
     )
@@ -1073,6 +1182,7 @@ async fn gateway_streams_sanitized_request_to_upstream_before_child_body_finishe
             provider_auth_secret: None,
             cache_entries: 128,
             streaming_json_threshold_bytes: 1,
+            ..GatewayConfig::default()
         },
         Arc::new(RwLock::new(registry)),
     )
@@ -1165,6 +1275,7 @@ async fn gateway_error_logs_do_not_include_raw_body_or_secret() {
             provider_auth_secret: None,
             cache_entries: 64,
             streaming_json_threshold_bytes: 256 * 1024,
+            ..GatewayConfig::default()
         },
         Arc::new(RwLock::new(registry)),
     )

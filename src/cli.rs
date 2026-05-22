@@ -8,10 +8,13 @@ use crate::{
     Result,
     gateway::{GatewayConfig, spawn_gateway},
     hardening,
+    patterns::CredentialPatternSet,
     process::{first_provider_key_from_env, run_child},
     secrets::{
-        SecretLabel, SecretRegistry, SecureBuf, discover_dotenv_candidates, discover_env_candidates,
+        SecretLabel, SecretRegistry, SecureBuf, discover_dotenv_candidates_with_patterns,
+        discover_env_candidates_with_patterns,
     },
+    stats,
 };
 
 #[derive(Debug, Parser)]
@@ -29,6 +32,12 @@ pub struct Cli {
     #[arg(long, env = "CREBRO_ENV_FILE", default_value = ".env")]
     pub env_file: std::path::PathBuf,
 
+    #[arg(long, env = "CREBRO_PATTERNS_FILE")]
+    pub patterns_file: Option<std::path::PathBuf>,
+
+    #[arg(long, env = "CREBRO_STATS_DIR")]
+    pub stats_dir: Option<std::path::PathBuf>,
+
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
 }
@@ -44,11 +53,17 @@ pub async fn run_with_cli(mut cli: Cli) -> Result<i32> {
         tracing::warn!(operation = failure.operation, "process hardening degraded");
     }
 
+    let patterns = if let Some(path) = &cli.patterns_file {
+        std::sync::Arc::new(CredentialPatternSet::from_path(path)?)
+    } else {
+        CredentialPatternSet::builtin()
+    };
+
     let mut registry = SecretRegistry::with_generated_keys();
-    for candidate in discover_env_candidates(512) {
+    for candidate in discover_env_candidates_with_patterns(512, &patterns) {
         registry.ingest(candidate.label, candidate.value)?;
     }
-    for candidate in discover_dotenv_candidates(&cli.env_file, 512)? {
+    for candidate in discover_dotenv_candidates_with_patterns(&cli.env_file, 512, &patterns)? {
         registry.ingest(candidate.label, candidate.value)?;
     }
 
@@ -78,6 +93,8 @@ pub async fn run_with_cli(mut cli: Cli) -> Result<i32> {
             provider_auth_secret,
             cache_entries: 4096,
             streaming_json_threshold_bytes: 256 * 1024,
+            patterns,
+            stats_path: stats::stats_path(cli.stats_dir.as_deref()),
         },
         Arc::new(RwLock::new(registry)),
     )

@@ -52,6 +52,37 @@ Crebro consumes the tags locally, registers the inner value as a normal
 encrypted in-memory secret capsule, and forwards only a Crebro placeholder
 upstream. v0.1 intentionally has no naming or reference syntax.
 
+## Credential Pattern Rules
+
+Built-in discovery and detector rules live in `patterns/credentials.toml`.
+Crebro compiles this TOML into the binary for zero-config use.
+
+The TOML contains env/.env discovery markers and request-time
+`credential_patterns`. Pattern entries use the explicit policy name
+`on_unregistered_match = "require_explicit_secret"` when a credential-looking
+value must not be forwarded unless it is already registered as a managed secret.
+
+Use a custom rule file with:
+
+```sh
+crebro --patterns-file ./patterns/credentials.toml -- codex
+```
+
+or:
+
+```sh
+CREBRO_PATTERNS_FILE=./patterns/credentials.toml crebro -- codex
+```
+
+## Local Stats
+
+When launched through the CLI, Crebro writes best-effort local stats to
+`~/.crebro/stats.json`. Override the directory with `--stats-dir` or
+`CREBRO_STATS_DIR`.
+
+The stats file stores counts by Crebro placeholder id and credential pattern id.
+It does not store raw secrets, raw prompts, or raw responses.
+
 ## Large Context Redaction
 
 Crebro scans JSON string values and ordinary text-bearing fields. Repeated no-secret strings, redaction spans, recognized message objects, and tool schemas are cached with keyed hashes so repeated coding-agent context can skip full rescans.
@@ -70,6 +101,9 @@ The core scenario test suite covers:
 - redaction cache and streaming sanitizer debug output hides cached prompt/string bytes
 - fingerprint-based redaction without a plaintext secret table
 - user-declared `<cb>...</cb>` secret directives, including malformed directive rejection
+- TOML-backed env/.env discovery and credential detector rules
+- `require_explicit_secret` rejection for unregistered credential-like request values
+- local stats recording for redacted placeholder ids and unregistered pattern ids without raw secrets
 - longest-match-first overlap handling, including later-starting longer spans
 - registry-empty streaming fast path that forwards bytes unchanged
 - no-secret and redaction-span cache reuse

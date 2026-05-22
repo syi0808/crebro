@@ -1,9 +1,11 @@
 use bytes::Bytes;
 use crebro::{
+    patterns::CredentialPatternSet,
     redact::{JsonSanitizer, RedactionCache, apply_spans, scan_string_token},
     secrets::{SecretLabel, SecretRegistry, SecureBuf},
 };
 use serde_json::json;
+use std::sync::Arc;
 
 fn registry_with(label: &str, secret: &[u8]) -> SecretRegistry {
     let mut registry = SecretRegistry::with_generated_keys();
@@ -308,6 +310,93 @@ fn field_policy_processes_user_secret_directives_in_known_binary_fields() {
 }
 
 #[test]
+fn custom_credential_pattern_requires_explicit_secret() {
+    let patterns = Arc::new(
+        CredentialPatternSet::from_toml(
+            r#"
+[env]
+key_markers = ["KEY"]
+common_values = ["true"]
+min_value_len = 4
+min_entropy = 1.0
+
+[[credential_patterns]]
+id = "test_credential"
+regex = '''TESTCRED_[A-Za-z0-9]{8,}'''
+on_unregistered_match = "require_explicit_secret"
+"#,
+        )
+        .unwrap(),
+    );
+    let mut registry = SecretRegistry::with_generated_keys();
+    let mut sanitizer = JsonSanitizer::with_patterns(64, patterns);
+    let payload = json!({
+        "messages": [{"role": "user", "content": "send TESTCRED_ABC123456"}]
+    });
+
+    let err = sanitizer
+        .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
+        .unwrap_err();
+
+    assert!(err.to_string().contains("test_credential"));
+    assert!(!err.to_string().contains("TESTCRED_ABC123456"));
+}
+
+#[test]
+fn user_secret_directive_satisfies_credential_pattern_detector() {
+    let mut registry = SecretRegistry::with_generated_keys();
+    let mut sanitizer = JsonSanitizer::new(64);
+    let secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+    let payload = json!({
+        "messages": [{"role": "user", "content": format!("send <cb>{secret}</cb>")}]
+    });
+
+    let (out, _) = sanitizer
+        .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
+        .unwrap();
+    let out_text = String::from_utf8_lossy(&out);
+
+    assert!(!out_text.contains(secret));
+    assert!(out_text.contains("{{CREBRO_SECRET:v1:USER:"));
+}
+
+#[test]
+fn allow_credential_pattern_reports_unregistered_match() {
+    let patterns = Arc::new(
+        CredentialPatternSet::from_toml(
+            r#"
+[env]
+key_markers = ["KEY"]
+common_values = ["true"]
+min_value_len = 4
+min_entropy = 1.0
+
+[[credential_patterns]]
+id = "allowed_test_credential"
+regex = '''ALLOWCRED_[A-Za-z0-9]{8,}'''
+on_unregistered_match = "allow"
+"#,
+        )
+        .unwrap(),
+    );
+    let mut registry = SecretRegistry::with_generated_keys();
+    let mut sanitizer = JsonSanitizer::with_patterns(64, patterns);
+    let payload = json!({
+        "messages": [{"role": "user", "content": "send ALLOWCRED_ABC123456"}]
+    });
+
+    let (out, report) = sanitizer
+        .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
+        .unwrap();
+
+    assert!(String::from_utf8_lossy(&out).contains("ALLOWCRED_ABC123456"));
+    assert_eq!(
+        report.unregistered_pattern_ids,
+        vec!["allowed_test_credential".to_string()]
+    );
+}
+
+#[test]
 fn tool_schema_cache_reuses_sanitized_output() {
     let mut registry = registry_with("TOOL_TOKEN", b"tool-secret-1234567890");
     let mut sanitizer = JsonSanitizer::new(64);
@@ -486,7 +575,19 @@ fn streaming_json_sanitizer_handles_user_secret_directive_split_across_chunks() 
 #[test]
 fn streaming_json_sanitizer_empty_registry_forwards_bytes_unchanged() {
     let mut registry = SecretRegistry::with_generated_keys();
-    let mut sanitizer = JsonSanitizer::new(64);
+    let patterns = Arc::new(
+        CredentialPatternSet::from_toml(
+            r#"
+[env]
+key_markers = ["KEY"]
+common_values = ["true"]
+min_value_len = 4
+min_entropy = 1.0
+"#,
+        )
+        .unwrap(),
+    );
+    let mut sanitizer = JsonSanitizer::with_patterns(64, patterns);
     let mut state = sanitizer.streaming_state();
     let mut out = Vec::new();
 

@@ -1,6 +1,6 @@
 use crate::{
     CrebroError, Result,
-    secrets::{SecretLabel, SecretRegistry, SecureBuf},
+    secrets::{SecretId, SecretLabel, SecretRegistry, SecureBuf},
 };
 
 pub(crate) const OPEN_TAG: &str = "<cb>";
@@ -11,7 +11,10 @@ const USER_DIRECTIVE_LABEL: &str = "USER";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DirectivePart<'a> {
     Plain(&'a str),
-    Placeholder(String),
+    Secret {
+        placeholder: String,
+        secret_id: SecretId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +65,10 @@ pub(crate) fn parse_user_secret_directives<'a>(
                     })?
                     .as_str()
                     .to_string();
-                parts.push(DirectivePart::Placeholder(placeholder));
+                parts.push(DirectivePart::Secret {
+                    placeholder,
+                    secret_id: id,
+                });
             }
         }
     }

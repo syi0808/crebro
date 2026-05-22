@@ -216,6 +216,11 @@ impl SecretRegistry {
         self.entry(id).map(|entry| &entry.placeholder)
     }
 
+    pub fn stats_identity_for(&self, id: SecretId) -> Option<(&str, &str)> {
+        self.entry(id)
+            .map(|entry| (entry.placeholder.as_str(), entry.label.as_str()))
+    }
+
     pub fn verify_window(&self, entry: &SecretEntry, window: &[u8]) -> Result<bool> {
         Ok(keyed_digest(self.keys.match_key(), window)? == entry.keyed_digest)
     }

@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
     Router,
@@ -20,9 +20,13 @@ use zeroize::Zeroize;
 
 use crate::{
     CrebroError, Result,
+    patterns::CredentialPatternSet,
     redact::JsonSanitizer,
     restore::ResponseRestorer,
-    secrets::{SecretId, SecretLabel, SecretRegistry, SecureBuf, is_secret_candidate},
+    secrets::{
+        SecretId, SecretLabel, SecretRegistry, SecureBuf, is_secret_candidate_with_patterns,
+    },
+    stats::StatsRecorder,
 };
 
 use super::{
@@ -37,6 +41,8 @@ pub struct GatewayConfig {
     pub provider_auth_secret: Option<SecretId>,
     pub cache_entries: usize,
     pub streaming_json_threshold_bytes: usize,
+    pub patterns: Arc<CredentialPatternSet>,
+    pub stats_path: Option<PathBuf>,
 }
 
 impl Default for GatewayConfig {
@@ -47,6 +53,8 @@ impl Default for GatewayConfig {
             provider_auth_secret: None,
             cache_entries: 4096,
             streaming_json_threshold_bytes: 256 * 1024,
+            patterns: CredentialPatternSet::builtin(),
+            stats_path: None,
         }
     }
 }
@@ -58,6 +66,8 @@ struct AppState {
     upstream_base: String,
     provider_auth_secret: Option<SecretId>,
     streaming_json_threshold_bytes: usize,
+    patterns: Arc<CredentialPatternSet>,
+    stats: StatsRecorder,
     client: reqwest::Client,
 }
 
@@ -94,10 +104,15 @@ pub async fn spawn_gateway(
         .map_err(|err| CrebroError::Gateway(format!("failed to read gateway address: {err}")))?;
     let state = AppState {
         registry,
-        sanitizer: Arc::new(Mutex::new(JsonSanitizer::new(config.cache_entries))),
+        sanitizer: Arc::new(Mutex::new(JsonSanitizer::with_patterns(
+            config.cache_entries,
+            Arc::clone(&config.patterns),
+        ))),
         upstream_base: config.upstream_base,
         provider_auth_secret: config.provider_auth_secret,
         streaming_json_threshold_bytes: config.streaming_json_threshold_bytes,
+        patterns: config.patterns,
+        stats: StatsRecorder::new(config.stats_path),
         client: reqwest::Client::new(),
     };
     let app = Router::new().fallback(any(proxy)).with_state(state);
@@ -123,14 +138,17 @@ async fn proxy(
     let provider = infer_provider_from_path(uri.path());
     tracing::debug!(provider = ?provider, path = uri.path(), "proxying provider request");
 
-    let observed_auth = register_observed_auth_header(&headers, &state.registry)
+    let observed_auth = register_observed_auth_header(&headers, &state.registry, &state.patterns)
         .await
         .map_err(GatewayHttpError::from)?;
 
     let is_json_request = is_json_request(&headers);
     let sanitized = sanitize_request_body(&state, &headers, body, is_json_request)
         .await
-        .map_err(GatewayHttpError::from)?;
+        .map_err(|err| {
+            state.stats.record_error(&err);
+            GatewayHttpError::from(err)
+        })?;
 
     let upstream_url = join_upstream_url(&state.upstream_base, path_and_query);
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
@@ -226,9 +244,9 @@ async fn sanitize_json_body(
             .map_err(|err| CrebroError::Gateway(format!("failed to read request body: {err}")))?;
         let mut sanitizer = state.sanitizer.lock().await;
         let mut registry = state.registry.write().await;
-        Ok(ReqwestBody::from(
-            sanitizer.sanitize_json(&body, &mut registry)?.0,
-        ))
+        let (sanitized, report) = sanitizer.sanitize_json(&body, &mut registry)?;
+        state.stats.record_sanitizer_report(&registry, &report);
+        Ok(ReqwestBody::from(sanitized))
     }
 }
 
@@ -308,10 +326,18 @@ async fn sanitize_json_body_stream(state: &AppState, body: Body) -> Result<Reqwe
     };
     let sanitizer = Arc::clone(&state.sanitizer);
     let registry = Arc::clone(&state.registry).write_owned().await;
+    let stats = state.stats.clone();
 
     let sanitized_stream = futures_util::stream::unfold(
-        (stream, sanitizer, registry, Some(stream_state), false),
-        |(mut stream, sanitizer, mut registry, mut stream_state, finished)| async move {
+        (
+            stream,
+            sanitizer,
+            registry,
+            stats,
+            Some(stream_state),
+            false,
+        ),
+        |(mut stream, sanitizer, mut registry, stats, mut stream_state, finished)| async move {
             if finished {
                 return None;
             }
@@ -329,13 +355,14 @@ async fn sanitize_json_body_stream(state: &AppState, body: Body) -> Result<Reqwe
                             Ok(out) => {
                                 return Some((
                                     Ok::<Bytes, CrebroError>(Bytes::from(out)),
-                                    (stream, sanitizer, registry, stream_state, false),
+                                    (stream, sanitizer, registry, stats, stream_state, false),
                                 ));
                             }
                             Err(err) => {
+                                stats.record_error(&err);
                                 return Some((
                                     Err(err),
-                                    (stream, sanitizer, registry, stream_state, true),
+                                    (stream, sanitizer, registry, stats, stream_state, true),
                                 ));
                             }
                         }
@@ -345,7 +372,7 @@ async fn sanitize_json_body_stream(state: &AppState, body: Body) -> Result<Reqwe
                             Err(CrebroError::Gateway(format!(
                                 "failed to read request chunk: {err}"
                             ))),
-                            (stream, sanitizer, registry, stream_state, true),
+                            (stream, sanitizer, registry, stats, stream_state, true),
                         ));
                     }
                     None => {
@@ -356,16 +383,18 @@ async fn sanitize_json_body_stream(state: &AppState, body: Body) -> Result<Reqwe
                         };
                         match finished {
                             Ok((tail, _report)) if tail.is_empty() => return None,
-                            Ok((tail, _report)) => {
+                            Ok((tail, report)) => {
+                                stats.record_sanitizer_report(&registry, &report);
                                 return Some((
                                     Ok(Bytes::from(tail)),
-                                    (stream, sanitizer, registry, stream_state, true),
+                                    (stream, sanitizer, registry, stats, stream_state, true),
                                 ));
                             }
                             Err(err) => {
+                                stats.record_error(&err);
                                 return Some((
                                     Err(err),
-                                    (stream, sanitizer, registry, stream_state, true),
+                                    (stream, sanitizer, registry, stats, stream_state, true),
                                 ));
                             }
                         }
@@ -430,12 +459,13 @@ impl ObservedAuth {
 async fn register_observed_auth_header(
     headers: &HeaderMap,
     registry: &Arc<RwLock<SecretRegistry>>,
+    patterns: &CredentialPatternSet,
 ) -> Result<Option<ObservedAuth>> {
     if let Some(value) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         && let Some(token) = bearer_token(value)
-        && is_observable_secret("AUTHORIZATION", token.as_bytes())
+        && is_observable_secret("AUTHORIZATION", token.as_bytes(), patterns)
     {
         let id = registry.write().await.ingest(
             SecretLabel::new("AUTHORIZATION"),
@@ -462,7 +492,7 @@ async fn register_observed_auth_header(
         else {
             continue;
         };
-        if !is_observable_secret(name, value.as_bytes()) {
+        if !is_observable_secret(name, value.as_bytes(), patterns) {
             continue;
         }
         let id = registry.write().await.ingest(
@@ -491,8 +521,9 @@ fn bearer_token(value: &str) -> Option<&str> {
     if token.is_empty() { None } else { Some(token) }
 }
 
-fn is_observable_secret(label: &str, value: &[u8]) -> bool {
-    value != b"crebro-local-placeholder" && is_secret_candidate(label, value)
+fn is_observable_secret(label: &str, value: &[u8], patterns: &CredentialPatternSet) -> bool {
+    value != b"crebro-local-placeholder"
+        && is_secret_candidate_with_patterns(label, value, patterns)
 }
 
 fn is_provider_auth_header(key: &HeaderName) -> bool {
@@ -557,6 +588,7 @@ impl From<CrebroError> for GatewayHttpError {
     fn from(value: CrebroError) -> Self {
         match value {
             CrebroError::Redaction(message) => Self::bad_request(message),
+            CrebroError::UnregisteredCredential { .. } => Self::bad_request(value.to_string()),
             other => Self::bad_gateway(other.to_string()),
         }
     }

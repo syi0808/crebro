@@ -2,34 +2,9 @@ use std::{env, path::Path};
 
 use zeroize::Zeroize;
 
-use crate::Result;
+use crate::{Result, patterns::CredentialPatternSet};
 
 use super::{SecretLabel, SecureBuf};
-
-const SECRET_KEY_MARKERS: &[&str] = &[
-    "KEY",
-    "TOKEN",
-    "SECRET",
-    "PASSWORD",
-    "PASS",
-    "AUTH",
-    "CREDENTIAL",
-    "PRIVATE",
-    "CERT",
-    "DATABASE_URL",
-    "CONNECTION_STRING",
-];
-
-const COMMON_VALUES: &[&str] = &[
-    "true",
-    "false",
-    "debug",
-    "development",
-    "production",
-    "test",
-    "localhost",
-    "127.0.0.1",
-];
 
 #[derive(Debug)]
 pub struct SecretCandidate {
@@ -38,6 +13,14 @@ pub struct SecretCandidate {
 }
 
 pub fn discover_env_candidates(max: usize) -> Vec<SecretCandidate> {
+    let patterns = CredentialPatternSet::builtin();
+    discover_env_candidates_with_patterns(max, &patterns)
+}
+
+pub fn discover_env_candidates_with_patterns(
+    max: usize,
+    patterns: &CredentialPatternSet,
+) -> Vec<SecretCandidate> {
     let mut candidates = Vec::new();
     for (key, value) in env::vars_os() {
         if candidates.len() >= max {
@@ -47,7 +30,7 @@ pub fn discover_env_candidates(max: usize) -> Vec<SecretCandidate> {
             continue;
         };
         let mut value_bytes = value.to_string_lossy().as_bytes().to_vec();
-        if is_secret_candidate(key, &value_bytes) {
+        if is_secret_candidate_with_patterns(key, &value_bytes, patterns) {
             candidates.push(SecretCandidate {
                 label: SecretLabel::new(key),
                 value: SecureBuf::new(std::mem::take(&mut value_bytes)),
@@ -62,6 +45,15 @@ pub fn discover_dotenv_candidates(
     path: impl AsRef<Path>,
     max: usize,
 ) -> Result<Vec<SecretCandidate>> {
+    let patterns = CredentialPatternSet::builtin();
+    discover_dotenv_candidates_with_patterns(path, max, &patterns)
+}
+
+pub fn discover_dotenv_candidates_with_patterns(
+    path: impl AsRef<Path>,
+    max: usize,
+    patterns: &CredentialPatternSet,
+) -> Result<Vec<SecretCandidate>> {
     let path = path.as_ref();
     let mut bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -69,12 +61,16 @@ pub fn discover_dotenv_candidates(
         Err(err) => return Err(err.into()),
     };
 
-    let candidates = parse_dotenv_candidates_from_bytes(&mut bytes, max);
+    let candidates = parse_dotenv_candidates_from_bytes(&mut bytes, max, patterns);
     bytes.zeroize();
     Ok(candidates)
 }
 
-fn parse_dotenv_candidates_from_bytes(bytes: &mut [u8], max: usize) -> Vec<SecretCandidate> {
+fn parse_dotenv_candidates_from_bytes(
+    bytes: &mut [u8],
+    max: usize,
+    patterns: &CredentialPatternSet,
+) -> Vec<SecretCandidate> {
     let mut candidates = Vec::new();
     for line in bytes.split(|byte| *byte == b'\n') {
         if candidates.len() >= max {
@@ -93,7 +89,7 @@ fn parse_dotenv_candidates_from_bytes(bytes: &mut [u8], max: usize) -> Vec<Secre
         let Ok(key) = std::str::from_utf8(key) else {
             continue;
         };
-        if is_secret_candidate(key, value) {
+        if is_secret_candidate_with_patterns(key, value, patterns) {
             candidates.push(SecretCandidate {
                 label: SecretLabel::new(key),
                 value: SecureBuf::from_slice(value),
@@ -105,39 +101,16 @@ fn parse_dotenv_candidates_from_bytes(bytes: &mut [u8], max: usize) -> Vec<Secre
 }
 
 pub fn is_secret_candidate(key: &str, value: &[u8]) -> bool {
-    let key_upper = key.to_ascii_uppercase();
-    if !SECRET_KEY_MARKERS
-        .iter()
-        .any(|marker| key_upper.contains(marker))
-    {
-        return false;
-    }
-
-    if value.len() < 12 {
-        return false;
-    }
-
-    let lower = String::from_utf8_lossy(value).to_ascii_lowercase();
-    if COMMON_VALUES.iter().any(|common| lower == *common) {
-        return false;
-    }
-    if lower.chars().all(|ch| ch.is_ascii_digit()) && lower.len() <= 16 {
-        return false;
-    }
-
-    rough_entropy(value) >= 3.0
+    let patterns = CredentialPatternSet::builtin();
+    is_secret_candidate_with_patterns(key, value, &patterns)
 }
 
-fn rough_entropy(value: &[u8]) -> f64 {
-    let mut seen = [false; 256];
-    let mut unique = 0usize;
-    for byte in value {
-        if !seen[*byte as usize] {
-            seen[*byte as usize] = true;
-            unique += 1;
-        }
-    }
-    (unique as f64).log2()
+pub fn is_secret_candidate_with_patterns(
+    key: &str,
+    value: &[u8],
+    patterns: &CredentialPatternSet,
+) -> bool {
+    patterns.is_secret_candidate(key, value)
 }
 
 fn trim_ascii(bytes: &[u8]) -> &[u8] {
@@ -174,13 +147,16 @@ fn strip_matching_quotes(bytes: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    use crate::patterns::CredentialPatternSet;
+
     use super::parse_dotenv_candidates_from_bytes;
 
     #[test]
     fn dotenv_source_bytes_are_zeroized_after_candidate_extraction() {
         let mut bytes =
             b"NODE_ENV=development\nOPENAI_API_KEY=sk-dotenv-zeroize-1234567890\n".to_vec();
-        let candidates = parse_dotenv_candidates_from_bytes(&mut bytes, 10);
+        let patterns = CredentialPatternSet::builtin();
+        let candidates = parse_dotenv_candidates_from_bytes(&mut bytes, 10, &patterns);
 
         assert_eq!(candidates.len(), 1);
         assert!(bytes.iter().all(|byte| *byte == 0));
