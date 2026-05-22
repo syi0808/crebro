@@ -21,6 +21,7 @@ pub struct CredentialPatternSet {
 
 #[derive(Debug, Clone)]
 pub struct EnvPatternRules {
+    exact_keys: Vec<String>,
     key_markers: Vec<String>,
     common_values: Vec<String>,
     min_value_len: usize,
@@ -57,6 +58,8 @@ struct RawPatternFile {
 
 #[derive(Debug, Deserialize)]
 struct RawEnvRules {
+    #[serde(default)]
+    exact_keys: Vec<String>,
     key_markers: Vec<String>,
     common_values: Vec<String>,
     min_value_len: usize,
@@ -161,7 +164,16 @@ impl RawEnvRules {
             ));
         }
         Ok(EnvPatternRules {
-            key_markers: self.key_markers,
+            exact_keys: self
+                .exact_keys
+                .into_iter()
+                .map(|key| key.to_ascii_uppercase())
+                .collect(),
+            key_markers: self
+                .key_markers
+                .into_iter()
+                .map(|marker| marker.to_ascii_uppercase())
+                .collect(),
             common_values: self
                 .common_values
                 .into_iter()
@@ -177,9 +189,13 @@ impl EnvPatternRules {
     fn is_secret_candidate(&self, key: &str, value: &[u8]) -> bool {
         let key_upper = key.to_ascii_uppercase();
         if !self
-            .key_markers
+            .exact_keys
             .iter()
-            .any(|marker| key_upper.contains(&marker.to_ascii_uppercase()))
+            .any(|exact| key_upper.as_str() == exact)
+            && !self
+                .key_markers
+                .iter()
+                .any(|marker| key_upper.contains(marker))
         {
             return false;
         }

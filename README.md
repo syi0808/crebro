@@ -57,10 +57,13 @@ upstream. v0.1 intentionally has no naming or reference syntax.
 Built-in discovery and detector rules live in `patterns/credentials.toml`.
 Crebro compiles this TOML into the binary for zero-config use.
 
-The TOML contains env/.env discovery markers and request-time
+The TOML contains exact env keys, env/.env discovery markers, and request-time
 `credential_patterns`. Pattern entries use the explicit policy name
 `on_unregistered_match = "require_explicit_secret"` when a credential-looking
 value must not be forwarded unless it is already registered as a managed secret.
+Ambiguous identifiers or intentionally client-visible keys can use
+`on_unregistered_match = "allow"` so they are counted in local stats without
+blocking the request.
 
 Use a custom rule file with:
 

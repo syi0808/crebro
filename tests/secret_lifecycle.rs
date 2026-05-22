@@ -92,10 +92,56 @@ fn secret_candidate_filtering_accepts_keys_and_rejects_common_values() {
         "DATABASE_URL",
         b"postgres://user:password@localhost/db"
     ));
+    assert!(is_secret_candidate(
+        "NEXTAUTH_SECRET",
+        b"next-auth-secret-1234567890"
+    ));
+    assert!(is_secret_candidate(
+        "PGPASSWORD",
+        b"postgres-password-1234567890"
+    ));
+    assert!(is_secret_candidate(
+        "MONGODB_URI",
+        b"mongodb://user:password@example.com/app"
+    ));
+    assert!(is_secret_candidate(
+        "SLACK_WEBHOOK_URL",
+        b"https://hooks.slack.com/services/T000/B000/secret"
+    ));
+    assert!(is_secret_candidate(
+        "KUBECONFIG_DATA",
+        b"apiVersion: v1\nusers:\n- token: secret-token"
+    ));
+    assert!(is_secret_candidate(
+        "GOOGLE_APPLICATION_CREDENTIALS_JSON",
+        br#"{"private_key":"-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----"}"#
+    ));
     assert!(!is_secret_candidate("NODE_ENV", b"development"));
     assert!(!is_secret_candidate("PORT", b"3000"));
     assert!(!is_secret_candidate("DEBUG", b"true"));
     assert!(!is_secret_candidate("API_KEY", b"short"));
+    assert!(!is_secret_candidate("OPENAI_API_KEY", b"your_api_key_here"));
+    assert!(!is_secret_candidate("WEBHOOK_SECRET", b"dummy-secret"));
+    assert!(!is_secret_candidate(
+        "MYSQL_PWD",
+        b"replace_with_your_api_key"
+    ));
+    assert!(!is_secret_candidate(
+        "PIP_INDEX_URL",
+        b"https://pypi.org/simple"
+    ));
+    assert!(!is_secret_candidate(
+        "SERVICE_ACCOUNT_EMAIL",
+        b"bot@example.iam.gserviceaccount.com"
+    ));
+    assert!(!is_secret_candidate(
+        "AWS_SHARED_CREDENTIALS_FILE",
+        b"/Users/me/.aws/credentials"
+    ));
+    assert!(!is_secret_candidate(
+        "SENTRY_DSN",
+        b"https://public@example.ingest.sentry.io/1"
+    ));
 }
 
 #[test]
