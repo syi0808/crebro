@@ -1,0 +1,541 @@
+use bytes::Bytes;
+use crebro::{
+    redact::{JsonSanitizer, RedactionCache, apply_spans, scan_string_token},
+    secrets::{SecretLabel, SecretRegistry, SecureBuf},
+};
+use serde_json::json;
+
+fn registry_with(label: &str, secret: &[u8]) -> SecretRegistry {
+    let mut registry = SecretRegistry::with_generated_keys();
+    registry
+        .ingest(SecretLabel::new(label), SecureBuf::from_slice(secret))
+        .unwrap();
+    registry
+}
+
+#[test]
+fn scanner_longest_match_first() {
+    let mut registry = SecretRegistry::with_generated_keys();
+    registry
+        .ingest(SecretLabel::new("A"), SecureBuf::from_slice(b"abcdef"))
+        .unwrap();
+    registry
+        .ingest(SecretLabel::new("B"), SecureBuf::from_slice(b"cde"))
+        .unwrap();
+
+    let spans = scan_string_token(b"xxabcdefyy", &registry).unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].start, 2);
+    assert_eq!(spans[0].len, 6);
+    let out = apply_spans(b"xxabcdefyy", &spans);
+    assert!(!String::from_utf8_lossy(&out).contains("abcdef"));
+}
+
+#[test]
+fn scanner_longest_match_wins_even_when_later_overlap_starts_inside_shorter_secret() {
+    let mut registry = SecretRegistry::with_generated_keys();
+    registry
+        .ingest(SecretLabel::new("SHORT"), SecureBuf::from_slice(b"abc"))
+        .unwrap();
+    registry
+        .ingest(SecretLabel::new("LONG"), SecureBuf::from_slice(b"bcdefgh"))
+        .unwrap();
+
+    let spans = scan_string_token(b"abcdefgh", &registry).unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].start, 1);
+    assert_eq!(spans[0].len, 7);
+    let out = apply_spans(b"abcdefgh", &spans);
+    let out_text = String::from_utf8_lossy(&out);
+    assert!(out_text.contains("a{{CREBRO_SECRET:v1:LONG:"));
+    assert!(!out_text.contains("bcdefgh"));
+}
+
+#[test]
+fn redacts_without_plaintext_secret_table() {
+    let raw_secret = b"ghp_real_secret_1234567890";
+    let registry = registry_with("GITHUB_TOKEN", raw_secret);
+    let request = b"use ghp_real_secret_1234567890 now";
+    let spans = scan_string_token(request, &registry).unwrap();
+    let out = apply_spans(request, &spans);
+    let out_text = String::from_utf8_lossy(&out);
+    assert!(!out_text.contains("ghp_real_secret_1234567890"));
+    assert!(out_text.contains("{{CREBRO_SECRET:v1:GITHUB_TOKEN:"));
+    assert!(!format!("{registry:?}").contains("ghp_real_secret_1234567890"));
+}
+
+#[test]
+fn no_secret_cache_hit_skips_scan() {
+    let registry = registry_with("OPENAI_API_KEY", b"sk-test-secret-1234567890");
+    let mut cache = RedactionCache::new(32);
+    let input = b"ordinary long prompt without the registered value";
+    let first = cache.sanitize_string(input, &registry).unwrap();
+    let stats_after_first = cache.stats();
+    let second = cache.sanitize_string(input, &registry).unwrap();
+    let stats_after_second = cache.stats();
+
+    assert_eq!(first, second);
+    assert_eq!(stats_after_first.scanner_runs, 1);
+    assert_eq!(stats_after_second.scanner_runs, 1);
+    assert_eq!(stats_after_second.hits, stats_after_first.hits + 1);
+}
+
+#[test]
+fn span_cache_reuses_redaction_offsets() {
+    let registry = registry_with("OPENAI_API_KEY", b"sk-test-secret-1234567890");
+    let mut cache = RedactionCache::new(32);
+    let input = b"secret sk-test-secret-1234567890 appears";
+    let first = cache.sanitize_string(input, &registry).unwrap();
+    let stats_after_first = cache.stats();
+    let second = cache.sanitize_string(input, &registry).unwrap();
+    let stats_after_second = cache.stats();
+
+    assert_eq!(first, second);
+    assert!(!String::from_utf8_lossy(&second).contains("sk-test-secret-1234567890"));
+    assert_eq!(stats_after_first.scanner_runs, 1);
+    assert_eq!(stats_after_second.scanner_runs, 1);
+    assert_eq!(stats_after_second.hits, stats_after_first.hits + 1);
+}
+
+#[test]
+fn bounded_cache_evicts_least_recently_used_entry() {
+    let registry = registry_with("OPENAI_API_KEY", b"sk-test-secret-1234567890");
+    let mut cache = RedactionCache::new(2);
+    let first = b"first ordinary prompt long enough";
+    let second = b"second ordinary prompt long enough";
+    let third = b"third ordinary prompt long enough";
+
+    cache.sanitize_string(first, &registry).unwrap();
+    cache.sanitize_string(second, &registry).unwrap();
+    cache.sanitize_string(first, &registry).unwrap();
+    let before_eviction = cache.stats();
+    cache.sanitize_string(third, &registry).unwrap();
+    let after_eviction = cache.stats();
+    cache.sanitize_string(first, &registry).unwrap();
+    let after_first_reuse = cache.stats();
+    cache.sanitize_string(second, &registry).unwrap();
+    let after_second_reuse = cache.stats();
+
+    assert_eq!(after_eviction.evictions, before_eviction.evictions + 1);
+    assert_eq!(after_first_reuse.hits, after_eviction.hits + 1);
+    assert_eq!(
+        after_second_reuse.scanner_runs,
+        after_first_reuse.scanner_runs + 1
+    );
+}
+
+#[test]
+fn no_secret_cache_invalidates_on_registry_change() {
+    let mut registry = SecretRegistry::with_generated_keys();
+    registry
+        .ingest(
+            SecretLabel::new("FIRST"),
+            SecureBuf::from_slice(b"first-secret-123456"),
+        )
+        .unwrap();
+    let mut cache = RedactionCache::new(32);
+    let input = b"contains second-secret-123456 but not the first";
+    let first = cache.sanitize_string(input, &registry).unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("second-secret-123456"));
+
+    registry
+        .ingest(
+            SecretLabel::new("SECOND"),
+            SecureBuf::from_slice(b"second-secret-123456"),
+        )
+        .unwrap();
+    let second = cache.sanitize_string(input, &registry).unwrap();
+    assert!(!String::from_utf8_lossy(&second).contains("second-secret-123456"));
+    assert!(cache.stats().flushes >= 2);
+}
+
+#[test]
+fn json_sanitizer_redacts_string_tokens_only() {
+    let mut registry = registry_with("GITHUB_TOKEN", b"ghp_real_secret_1234567890");
+    let mut sanitizer = JsonSanitizer::new(64);
+    let payload = json!({
+        "messages": [
+            {"role": "user", "content": "token ghp_real_secret_1234567890"},
+            {"role": "assistant", "content": 42}
+        ],
+        "temperature": 0,
+        "stream": true
+    });
+    let (out, _) = sanitizer
+        .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
+        .unwrap();
+    let out_value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert!(!String::from_utf8_lossy(&out).contains("ghp_real_secret_1234567890"));
+    assert_eq!(out_value["temperature"], 0);
+    assert_eq!(out_value["stream"], true);
+}
+
+#[test]
+fn field_policy_skips_known_binary_fields() {
+    let mut registry = registry_with("TOKEN", b"secret-in-binary-field");
+    let mut sanitizer = JsonSanitizer::new(64);
+    let payload = json!({
+        "contents": [{
+            "parts": [{
+                "inline_data": {
+                    "mime_type": "image/png",
+                    "data": "secret-in-binary-field"
+                }
+            }, {
+                "text": "secret-in-binary-field"
+            }]
+        }]
+    });
+    let (out, _) = sanitizer
+        .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
+        .unwrap();
+    let stats_after_first = sanitizer.cache_stats();
+    let out_value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        out_value["contents"][0]["parts"][0]["inline_data"]["data"],
+        "secret-in-binary-field"
+    );
+    assert!(
+        out_value["contents"][0]["parts"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("{{CREBRO_SECRET:v1:TOKEN:")
+    );
+    assert_eq!(stats_after_first.misses, 1);
+    assert_eq!(stats_after_first.scanner_runs, 1);
+}
+
+#[test]
+fn user_secret_directive_redacts_repeated_plaintext_in_same_string() {
+    let mut registry = SecretRegistry::with_generated_keys();
+    let mut sanitizer = JsonSanitizer::new(64);
+    let payload = json!({
+        "messages": [{
+            "role": "user",
+            "content": "use <cb>manual-secret-1234567890</cb> and manual-secret-1234567890 again"
+        }]
+    });
+
+    let (out, _) = sanitizer
+        .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
+        .unwrap();
+    let out_text = String::from_utf8_lossy(&out);
+
+    assert!(!out_text.contains("manual-secret-1234567890"));
+    assert!(!out_text.contains("<cb>"));
+    assert!(!out_text.contains("</cb>"));
+    assert!(out_text.contains("{{CREBRO_SECRET:v1:USER:"));
+    assert!(!format!("{registry:?}").contains("manual-secret-1234567890"));
+}
+
+#[test]
+fn user_secret_directive_rejects_malformed_tags() {
+    for content in [
+        "use <cb>manual-secret-1234567890",
+        "use manual-secret-1234567890</cb>",
+        "use <cb></cb>",
+        "use <cb>outer <cb>inner</cb></cb>",
+    ] {
+        let mut registry = SecretRegistry::with_generated_keys();
+        let mut sanitizer = JsonSanitizer::new(64);
+        let payload = json!({"messages": [{"role": "user", "content": content}]});
+        let err = sanitizer
+            .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("directive"),
+            "unexpected error for {content:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn user_secret_directive_does_not_rescan_inserted_placeholder() {
+    let mut registry = SecretRegistry::with_generated_keys();
+    let mut sanitizer = JsonSanitizer::new(64);
+    let payload = json!({
+        "messages": [{
+            "role": "user",
+            "content": "<cb>CREBRO_SECRET</cb> then CREBRO_SECRET"
+        }]
+    });
+
+    let (out, _) = sanitizer
+        .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
+        .unwrap();
+    let out_text = String::from_utf8_lossy(&out);
+
+    assert!(out_text.contains("{{CREBRO_SECRET:v1:USER:"));
+    assert!(!out_text.contains("{{{{CREBRO_SECRET"));
+    serde_json::from_slice::<serde_json::Value>(&out).unwrap();
+}
+
+#[test]
+fn field_policy_processes_user_secret_directives_in_known_binary_fields() {
+    let mut registry = SecretRegistry::with_generated_keys();
+    let mut sanitizer = JsonSanitizer::new(64);
+    let payload = json!({
+        "contents": [{
+            "parts": [{
+                "inline_data": {
+                    "mime_type": "image/png",
+                    "data": "<cb>binary-secret-1234567890</cb>"
+                }
+            }, {
+                "text": "<cb>text-secret-1234567890</cb>"
+            }]
+        }]
+    });
+
+    let (out, _) = sanitizer
+        .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
+        .unwrap();
+    let out_value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+    let binary_data = out_value["contents"][0]["parts"][0]["inline_data"]["data"]
+        .as_str()
+        .unwrap();
+    assert!(!binary_data.contains("binary-secret-1234567890"));
+    assert!(!binary_data.contains("<cb>"));
+    assert!(binary_data.contains("{{CREBRO_SECRET:v1:USER:"));
+    assert!(
+        out_value["contents"][0]["parts"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("{{CREBRO_SECRET:v1:USER:")
+    );
+}
+
+#[test]
+fn tool_schema_cache_reuses_sanitized_output() {
+    let mut registry = registry_with("TOOL_TOKEN", b"tool-secret-1234567890");
+    let mut sanitizer = JsonSanitizer::new(64);
+    let payload = json!({
+        "tools": [{
+            "name": "shell",
+            "description": "do not leak tool-secret-1234567890",
+            "parameters": {"type": "object"}
+        }]
+    });
+    let body = serde_json::to_vec(&payload).unwrap();
+    let (_, _) = sanitizer.sanitize_json(&body, &mut registry).unwrap();
+    let stats_after_first = sanitizer.cache_stats();
+    let (_, _) = sanitizer.sanitize_json(&body, &mut registry).unwrap();
+    let stats_after_second = sanitizer.cache_stats();
+    assert_eq!(
+        stats_after_second.scanner_runs,
+        stats_after_first.scanner_runs
+    );
+    assert!(stats_after_second.hits > stats_after_first.hits);
+}
+
+#[test]
+fn message_object_cache_reuses_sanitized_output() {
+    let mut registry = registry_with("MESSAGE_TOKEN", b"message-secret-1234567890");
+    let mut sanitizer = JsonSanitizer::new(64);
+    let payload = json!({
+        "messages": [{
+            "role": "user",
+            "content": "do not leak message-secret-1234567890"
+        }]
+    });
+    let body = serde_json::to_vec(&payload).unwrap();
+
+    let (_, _) = sanitizer.sanitize_json(&body, &mut registry).unwrap();
+    let stats_after_first = sanitizer.cache_stats();
+    let (out, _) = sanitizer.sanitize_json(&body, &mut registry).unwrap();
+    let stats_after_second = sanitizer.cache_stats();
+
+    assert!(!String::from_utf8_lossy(&out).contains("message-secret-1234567890"));
+    assert_eq!(
+        stats_after_second.scanner_runs,
+        stats_after_first.scanner_runs
+    );
+    assert!(stats_after_second.hits > stats_after_first.hits);
+}
+
+#[test]
+fn sanitizer_debug_does_not_expose_cached_prompt_or_streaming_string_bytes() {
+    let mut registry = registry_with("DEBUG_TOKEN", b"debug-secret-1234567890");
+    let mut sanitizer = JsonSanitizer::new(64);
+    let payload = json!({
+        "tools": [{
+            "name": "shell",
+            "description": "private prompt debug-secret-1234567890"
+        }]
+    });
+    let body = serde_json::to_vec(&payload).unwrap();
+    sanitizer.sanitize_json(&body, &mut registry).unwrap();
+
+    let sanitizer_debug = format!("{sanitizer:?}");
+    assert!(!sanitizer_debug.contains("private prompt"));
+    assert!(!sanitizer_debug.contains("debug-secret-1234567890"));
+    assert!(!sanitizer_debug.contains("{{CREBRO_SECRET"));
+
+    let mut state = sanitizer.streaming_state();
+    sanitizer
+        .push_stream_chunk(
+            &mut state,
+            &Bytes::from_static(br#"{"messages":["debug-secret-1234567890"#),
+            &mut registry,
+        )
+        .unwrap();
+    let state_debug = format!("{state:?}");
+    assert!(!state_debug.contains("debug-secret-1234567890"));
+    assert!(state_debug.contains("raw_string_len"));
+}
+
+#[test]
+fn chunk_cache_redacts_secret_across_large_string_boundary() {
+    let registry = registry_with("BOUNDARY_TOKEN", b"boundary-secret-1234567890");
+    let mut cache = RedactionCache::new_with_chunk_size(64, 1024);
+    let mut input = vec![b'a'; 1010];
+    input.extend_from_slice(b"boundary-secret-1234567890");
+    input.extend_from_slice(&[b'z'; 1200]);
+
+    let first = cache.sanitize_string(&input, &registry).unwrap();
+    let stats_after_first = cache.stats();
+    let second = cache.sanitize_string(&input, &registry).unwrap();
+    let stats_after_second = cache.stats();
+
+    assert_eq!(first, second);
+    assert!(!String::from_utf8_lossy(&second).contains("boundary-secret-1234567890"));
+    assert!(String::from_utf8_lossy(&second).contains("{{CREBRO_SECRET:v1:BOUNDARY_TOKEN:"));
+    assert_eq!(
+        stats_after_second.scanner_runs,
+        stats_after_first.scanner_runs
+    );
+    assert!(stats_after_second.hits > stats_after_first.hits);
+}
+
+#[test]
+fn chunk_cache_resolves_overlapping_spans_across_windows_longest_first() {
+    let mut registry = SecretRegistry::with_generated_keys();
+    registry
+        .ingest(SecretLabel::new("SHORT"), SecureBuf::from_slice(b"abc"))
+        .unwrap();
+    registry
+        .ingest(SecretLabel::new("LONG"), SecureBuf::from_slice(b"bcdefgh"))
+        .unwrap();
+    let mut cache = RedactionCache::new_with_chunk_size(64, 1024);
+    let mut input = vec![b'x'; 1023];
+    input.extend_from_slice(b"abcdefgh");
+    input.extend_from_slice(&[b'y'; 1200]);
+
+    let out = cache.sanitize_string(&input, &registry).unwrap();
+    let out_text = String::from_utf8_lossy(&out);
+
+    assert!(out_text.contains("a{{CREBRO_SECRET:v1:LONG:"));
+    assert!(!out_text.contains("bcdefgh"));
+    assert_eq!(cache.stats().scanner_runs, 3);
+}
+
+#[test]
+fn streaming_json_sanitizer_redacts_string_split_across_chunks() {
+    let mut registry = registry_with("STREAM_TOKEN", b"stream-secret-1234567890");
+    let mut sanitizer = JsonSanitizer::new(64);
+    let mut state = sanitizer.streaming_state();
+    let mut out = Vec::new();
+
+    for chunk in [
+        Bytes::from_static(br#"{"messages":["prefix stream-"#),
+        Bytes::from_static(br#"secret-1234567890 suffix"]}"#),
+    ] {
+        out.extend(
+            sanitizer
+                .push_stream_chunk(&mut state, &chunk, &mut registry)
+                .unwrap(),
+        );
+    }
+    out.extend(sanitizer.finish_stream(state, &mut registry).unwrap().0);
+
+    let out_text = String::from_utf8_lossy(&out);
+    assert!(!out_text.contains("stream-secret-1234567890"));
+    assert!(out_text.contains("{{CREBRO_SECRET:v1:STREAM_TOKEN:"));
+    serde_json::from_slice::<serde_json::Value>(&out).unwrap();
+}
+
+#[test]
+fn streaming_json_sanitizer_handles_user_secret_directive_split_across_chunks() {
+    let mut registry = SecretRegistry::with_generated_keys();
+    let mut sanitizer = JsonSanitizer::new(64);
+    let mut state = sanitizer.streaming_state();
+    let mut out = Vec::new();
+
+    for chunk in [
+        Bytes::from_static(br#"{"messages":["prefix <cb>manual-"#),
+        Bytes::from_static(br#"secret-1234567890</cb> and manual-secret-1234567890"]}"#),
+    ] {
+        out.extend(
+            sanitizer
+                .push_stream_chunk(&mut state, &chunk, &mut registry)
+                .unwrap(),
+        );
+    }
+    out.extend(sanitizer.finish_stream(state, &mut registry).unwrap().0);
+
+    let out_text = String::from_utf8_lossy(&out);
+    assert!(!out_text.contains("manual-secret-1234567890"));
+    assert!(!out_text.contains("<cb>"));
+    assert!(!out_text.contains("</cb>"));
+    assert!(out_text.contains("{{CREBRO_SECRET:v1:USER:"));
+    serde_json::from_slice::<serde_json::Value>(&out).unwrap();
+}
+
+#[test]
+fn streaming_json_sanitizer_empty_registry_forwards_bytes_unchanged() {
+    let mut registry = SecretRegistry::with_generated_keys();
+    let mut sanitizer = JsonSanitizer::new(64);
+    let mut state = sanitizer.streaming_state();
+    let mut out = Vec::new();
+
+    for chunk in [
+        Bytes::from_static(br#"{"message":"keeps\noriginal\u0020escapes","#),
+        Bytes::from_static(br#""unterminated_for_parser_fast_path""#),
+    ] {
+        out.extend(
+            sanitizer
+                .push_stream_chunk(&mut state, &chunk, &mut registry)
+                .unwrap(),
+        );
+    }
+    out.extend(sanitizer.finish_stream(state, &mut registry).unwrap().0);
+
+    assert_eq!(
+        out,
+        br#"{"message":"keeps\noriginal\u0020escapes","unterminated_for_parser_fast_path""#
+    );
+}
+
+#[test]
+fn streaming_json_sanitizer_honors_binary_field_policy() {
+    let mut registry = registry_with("STREAM_BINARY_TOKEN", b"stream-binary-secret-1234567890");
+    let mut sanitizer = JsonSanitizer::new(64);
+    let mut state = sanitizer.streaming_state();
+    let mut out = Vec::new();
+
+    for chunk in [
+        Bytes::from_static(br#"{"contents":[{"parts":[{"inline_data":{"mime_type":"image/png","data":"stream-binary-"#),
+        Bytes::from_static(br#"secret-1234567890"}},{"text":"stream-binary-secret-1234567890"}]}]}"#),
+    ] {
+        out.extend(
+            sanitizer
+                .push_stream_chunk(&mut state, &chunk, &mut registry)
+                .unwrap(),
+        );
+    }
+    out.extend(sanitizer.finish_stream(state, &mut registry).unwrap().0);
+
+    let out_value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        out_value["contents"][0]["parts"][0]["inline_data"]["data"],
+        "stream-binary-secret-1234567890"
+    );
+    assert!(
+        out_value["contents"][0]["parts"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("{{CREBRO_SECRET:v1:STREAM_BINARY_TOKEN:")
+    );
+}
