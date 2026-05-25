@@ -31,6 +31,7 @@ use crate::{
 
 use super::{
     provider::{ProviderFamily, infer_provider_from_path},
+    tls::build_upstream_client,
     upstream::join_upstream_url,
 };
 
@@ -43,6 +44,7 @@ pub struct GatewayConfig {
     pub streaming_json_threshold_bytes: usize,
     pub patterns: Arc<CredentialPatternSet>,
     pub stats_path: Option<PathBuf>,
+    pub tls_keylog_file: Option<PathBuf>,
 }
 
 impl Default for GatewayConfig {
@@ -55,6 +57,7 @@ impl Default for GatewayConfig {
             streaming_json_threshold_bytes: 256 * 1024,
             patterns: CredentialPatternSet::builtin(),
             stats_path: None,
+            tls_keylog_file: None,
         }
     }
 }
@@ -102,6 +105,12 @@ pub async fn spawn_gateway(
     let addr = listener
         .local_addr()
         .map_err(|err| CrebroError::Gateway(format!("failed to read gateway address: {err}")))?;
+    if config.tls_keylog_file.is_some() {
+        tracing::warn!(
+            "TLS key logging is enabled for Crebro upstream traffic; use only for QA and delete the key log after capture"
+        );
+    }
+    let client = build_upstream_client(config.tls_keylog_file.as_deref())?;
     let state = AppState {
         registry,
         sanitizer: Arc::new(Mutex::new(JsonSanitizer::with_patterns(
@@ -113,7 +122,7 @@ pub async fn spawn_gateway(
         streaming_json_threshold_bytes: config.streaming_json_threshold_bytes,
         patterns: config.patterns,
         stats: StatsRecorder::new(config.stats_path),
-        client: reqwest::Client::new(),
+        client,
     };
     let app = Router::new().fallback(any(proxy)).with_state(state);
     let task = tokio::spawn(async move {

@@ -501,6 +501,41 @@ async fn gateway_records_unregistered_pattern_stats_on_reject() {
 }
 
 #[tokio::test]
+async fn gateway_accepts_qa_tls_keylog_file_configuration() {
+    let keylog_dir = unique_temp_dir("tls-keylog");
+    std::fs::create_dir_all(&keylog_dir).unwrap();
+    let keylog_path = keylog_dir.join("tls.keys");
+    let (upstream_url, bodies, _) = spawn_mock_upstream(b"{}".to_vec()).await;
+    let gateway = spawn_gateway(
+        GatewayConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            upstream_base: upstream_url,
+            tls_keylog_file: Some(keylog_path.clone()),
+            ..GatewayConfig::default()
+        },
+        Arc::new(RwLock::new(SecretRegistry::with_generated_keys())),
+    )
+    .await
+    .unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", gateway.url()))
+        .header("content-type", "application/json")
+        .body(r#"{"messages":[{"role":"user","content":"hello"}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(keylog_path.exists());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(bodies.lock().await.len(), 1);
+
+    let _ = std::fs::remove_file(&keylog_path);
+    let _ = std::fs::remove_dir(&keylog_dir);
+}
+
+#[tokio::test]
 async fn gateway_sanitizes_json_content_type_case_insensitively() {
     let (registry, _, _) = registry_with_secret();
     let (upstream_url, bodies, _) = spawn_mock_upstream(b"{}".to_vec()).await;
@@ -929,6 +964,7 @@ async fn cli_one_shot_wrapper_returns_child_exit_status() {
         env_file: std::env::temp_dir().join("crebro-test-missing.env"),
         patterns_file: None,
         stats_dir: Some(unique_temp_dir("cli-exit-stats")),
+        tls_keylog_file: None,
         command: vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -978,6 +1014,7 @@ if secret not in body or "{{CREBRO_SECRET" in body:
         env_file: std::env::temp_dir().join("crebro-test-missing.env"),
         patterns_file: None,
         stats_dir: Some(unique_temp_dir("cli-wrapper-stats")),
+        tls_keylog_file: None,
         command: vec!["python3".to_string(), "-c".to_string(), script],
     })
     .await

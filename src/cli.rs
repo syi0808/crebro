@@ -38,6 +38,9 @@ pub struct Cli {
     #[arg(long, env = "CREBRO_STATS_DIR")]
     pub stats_dir: Option<std::path::PathBuf>,
 
+    #[arg(long, env = "CREBRO_TLS_KEYLOG_FILE")]
+    pub tls_keylog_file: Option<std::path::PathBuf>,
+
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
 }
@@ -95,6 +98,7 @@ pub async fn run_with_cli(mut cli: Cli) -> Result<i32> {
             streaming_json_threshold_bytes: 256 * 1024,
             patterns,
             stats_path: stats::stats_path(cli.stats_dir.as_deref()),
+            tls_keylog_file: cli.tls_keylog_file,
         },
         Arc::new(RwLock::new(registry)),
     )

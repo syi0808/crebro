@@ -163,6 +163,24 @@ This proves process-level mediation, not HTTPS payload contents. To inspect
 request bodies and headers, point `--upstream-url` at a local recording upstream
 or use a dedicated HTTPS debugging proxy in a separate test profile.
 
+For Wireshark TLS decryption during live provider QA, enable Crebro-only TLS
+key logging:
+
+```sh
+CREBRO_TLS_KEYLOG_FILE=/tmp/crebro-tls.keys crebro -- codex
+```
+
+or:
+
+```sh
+crebro --tls-keylog-file /tmp/crebro-tls.keys -- codex
+```
+
+Then configure Wireshark's TLS `(Pre)-Master-Secret log filename` to the same
+file. This logs TLS traffic secrets for Crebro's upstream HTTPS connections and
+can reveal plaintext provider requests in the capture. Use it only in isolated
+QA sessions and delete the key log file after analysis.
+
 For the full local E2E test setup, including the `crebro-qa-upstream` recorder
 and fail-close canary checks, see
 `docs/qa/e2e-test-environment.md`.
