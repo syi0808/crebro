@@ -1,6 +1,6 @@
 # Crebro - Credential Broker
 
-Crebro is a local credential firewall for coding agents, starting with Codex, that keeps secrets out of external LLM requests.
+Crebro is a local credential broker for coding agents that keeps secrets out of external LLM requests.
 
 ## What It Does
 
@@ -36,12 +36,21 @@ Crebro is not a full security boundary.
 
 ## Test
 
-The current public test target is Codex.
+Crebro is intended to protect coding-agent traffic broadly. The first tested scope is Codex.
 
 Verified local routing surfaces:
 
 - Codex CLI 0.133.0 using OpenAI-compatible routing through `OPENAI_BASE_URL`
 - Codex ChatGPT auth traffic through child-scoped proxy environment variables and `chatgpt.com/backend-api`
+
+Manual Wireshark QA was also run with Crebro TLS key logging enabled. The capture was decrypted in Wireshark to inspect the outbound provider payload during a real Codex session.
+
+Evidence from that run is included below.
+
+| Evidence | Screenshot |
+| --- | --- |
+| Codex session routed through Crebro | ![Codex session routed through Crebro](docs/codex-chat.png) |
+| Wireshark payload inspection | ![Wireshark payload inspection](docs/wireshark-payload-log.png) |
 
 ## Install
 
