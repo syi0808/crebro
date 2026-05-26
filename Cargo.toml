@@ -2,7 +2,12 @@
 name = "crebro"
 version = "0.1.0"
 edition = "2024"
+description = "Local credential broker for coding agents that redacts secrets before LLM provider requests."
 license = "Apache-2.0"
+repository = "https://github.com/syi0808/crebro"
+readme = "README.md"
+keywords = ["credentials", "proxy", "llm", "redaction", "security"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 aho-corasick = "1"
