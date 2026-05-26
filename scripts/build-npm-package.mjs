@@ -17,6 +17,7 @@ const REPO_ROOT = path.resolve(SCRIPT_DIR, "..");
 const NPM_TEMPLATE_ROOT = path.join(REPO_ROOT, "npm");
 const PACKAGE_NAME = "crebro";
 const BINARY_BASENAME = "crebro";
+const NPM_COMMAND = process.platform === "win32" ? "npm.cmd" : "npm";
 
 const PLATFORM_PACKAGES = {
   "crebro-linux-x64": {
@@ -152,6 +153,10 @@ function run(command, args, options = {}) {
     encoding: "utf8",
     stdio: options.capture ? ["ignore", "pipe", "pipe"] : "inherit"
   });
+
+  if (result.error) {
+    throw new Error(`${command} ${args.join(" ")} failed: ${result.error.message}`);
+  }
 
   if (result.status !== 0) {
     if (options.capture) {
@@ -332,7 +337,7 @@ function stagePackage(stagingRoot, version, packageKey, skipBuild) {
 function packPackage(stagedPackage, packOutputDir) {
   mkdirSync(packOutputDir, { recursive: true });
   const stdout = run(
-    "npm",
+    NPM_COMMAND,
     ["pack", "--json", "--pack-destination", packOutputDir],
     { cwd: stagedPackage.stagingDir, capture: true }
   );
@@ -362,7 +367,7 @@ function publishPackage(stagedPackage, dryRun, otp) {
   if (otp) {
     args.push(`--otp=${otp}`);
   }
-  run("npm", args, { cwd: stagedPackage.stagingDir });
+  run(NPM_COMMAND, args, { cwd: stagedPackage.stagingDir });
 }
 
 function main() {
