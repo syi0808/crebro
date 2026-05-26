@@ -17,7 +17,7 @@ const REPO_ROOT = path.resolve(SCRIPT_DIR, "..");
 const NPM_TEMPLATE_ROOT = path.join(REPO_ROOT, "npm");
 const PACKAGE_NAME = "crebro";
 const BINARY_BASENAME = "crebro";
-const NPM_COMMAND = process.platform === "win32" ? "npm.cmd" : "npm";
+const NPM_COMMAND = process.platform === "win32" ? "cmd.exe" : "npm";
 
 const PLATFORM_PACKAGES = {
   "crebro-linux-x64": {
@@ -204,6 +204,10 @@ function runAllowingAlreadyPublished(command, args, options = {}) {
   throw new Error(`${command} ${args.join(" ")} failed with exit code ${result.status}`);
 }
 
+function npmArgs(args) {
+  return process.platform === "win32" ? ["/d", "/s", "/c", "npm", ...args] : args;
+}
+
 function isAlreadyPublishedError(output) {
   return (
     /\bEPUBLISHCONFLICT\b/i.test(output) ||
@@ -382,7 +386,7 @@ function packPackage(stagedPackage, packOutputDir) {
   mkdirSync(packOutputDir, { recursive: true });
   const stdout = run(
     NPM_COMMAND,
-    ["pack", "--json", "--pack-destination", packOutputDir],
+    npmArgs(["pack", "--json", "--pack-destination", packOutputDir]),
     { cwd: stagedPackage.stagingDir, capture: true }
   );
 
@@ -411,7 +415,7 @@ function publishPackage(stagedPackage, dryRun, otp) {
   if (otp) {
     args.push(`--otp=${otp}`);
   }
-  runAllowingAlreadyPublished(NPM_COMMAND, args, { cwd: stagedPackage.stagingDir });
+  runAllowingAlreadyPublished(NPM_COMMAND, npmArgs(args), { cwd: stagedPackage.stagingDir });
 }
 
 function main() {
