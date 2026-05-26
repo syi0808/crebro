@@ -169,6 +169,50 @@ function run(command, args, options = {}) {
   return result.stdout ?? "";
 }
 
+function runAllowingAlreadyPublished(command, args, options = {}) {
+  console.log(`+ ${[command, ...args].join(" ")}`);
+  const result = spawnSync(command, args, {
+    cwd: options.cwd ?? REPO_ROOT,
+    env: options.env ?? process.env,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+
+  if (result.error) {
+    throw new Error(`${command} ${args.join(" ")} failed: ${result.error.message}`);
+  }
+
+  if (result.status === 0) {
+    process.stdout.write(stdout);
+    process.stderr.write(stderr);
+    return;
+  }
+
+  const combinedOutput = `${stdout}\n${stderr}`;
+  if (isAlreadyPublishedError(combinedOutput)) {
+    process.stdout.write(stdout);
+    process.stderr.write(stderr);
+    console.log("Package version already exists on npm; treating publish as successful.");
+    return;
+  }
+
+  process.stdout.write(stdout);
+  process.stderr.write(stderr);
+  throw new Error(`${command} ${args.join(" ")} failed with exit code ${result.status}`);
+}
+
+function isAlreadyPublishedError(output) {
+  return (
+    /\bEPUBLISHCONFLICT\b/i.test(output) ||
+    /cannot publish over (?:the )?previously published versions?/i.test(output) ||
+    /previously published version/i.test(output) ||
+    /You cannot publish over the previously published versions/i.test(output)
+  );
+}
+
 function readJson(filePath) {
   return JSON.parse(readFileSync(filePath, "utf8"));
 }
@@ -367,7 +411,7 @@ function publishPackage(stagedPackage, dryRun, otp) {
   if (otp) {
     args.push(`--otp=${otp}`);
   }
-  run(NPM_COMMAND, args, { cwd: stagedPackage.stagingDir });
+  runAllowingAlreadyPublished(NPM_COMMAND, args, { cwd: stagedPackage.stagingDir });
 }
 
 function main() {
