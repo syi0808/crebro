@@ -17,8 +17,10 @@ Environment overrides:
   CREBRO_QA_SKIP_BUILD=1
   CREBRO_BIN=/absolute/path/to/crebro
 
-The script starts sudo tshark, runs the debug Crebro binary in proxy mode with
-TLS key logging enabled, then stops capture and writes a decrypted payload TSV.
+The script starts sudo tshark, runs the debug Crebro binary with TLS key logging
+enabled, then stops capture and writes a decrypted payload TSV. Provider key
+environment variables are cleared for this QA run so Codex ChatGPT-auth traffic
+uses Crebro's automatic proxy path.
 USAGE
 }
 
@@ -62,6 +64,17 @@ mkdir -p "$OUT_DIR"
 PCAP="$OUT_DIR/$RUN_ID.pcapng"
 KEYLOG="$OUT_DIR/$RUN_ID.tls.keys"
 TSV="$OUT_DIR/$RUN_ID.payloads.tsv"
+
+PROVIDER_KEY_ENV_NAMES=(
+  "OPENAI_API_KEY"
+  "ANTHROPIC_API_KEY"
+  "ANTHROPIC_AUTH_TOKEN"
+  "GEMINI_API_KEY"
+  "GOOGLE_API_KEY"
+  "GOOGLE_GENERATIVE_AI_API_KEY"
+  "OPENCODE_API_KEY"
+  "CREBRO_PROVIDER_API_KEY"
+)
 
 detect_iface() {
   route get "$HOST" 2>/dev/null | awk '/interface:/{print $2; exit}'
@@ -134,10 +147,16 @@ echo "Starting debug Crebro. Exit the child session when QA is done."
 echo "  crebro:    $CREBRO_BIN"
 echo "  keylog:    $KEYLOG"
 echo "  child:     ${CHILD_CMD[*]}"
+echo "  provider keys: cleared for QA proxy capture"
 echo
 
 set +e
-CREBRO_TLS_KEYLOG_FILE="$KEYLOG" "$CREBRO_BIN" --mode proxy -- "${CHILD_CMD[@]}"
+(
+  for key in "${PROVIDER_KEY_ENV_NAMES[@]}"; do
+    unset "$key"
+  done
+  CREBRO_TLS_KEYLOG_FILE="$KEYLOG" exec "$CREBRO_BIN" -- "${CHILD_CMD[@]}"
+)
 CREBRO_STATUS=$?
 
 stop_capture
