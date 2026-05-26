@@ -54,14 +54,18 @@ Evidence from that run is included below.
 
 ## Install
 
-Crebro is currently installed from source.
-
 ### Requirements
 
 - Rust toolchain with Rust 2024 edition support
 - A supported child agent command, such as `codex`
 
-### Build And Install
+### Install From crates.io
+
+```sh
+cargo install crebro
+```
+
+### Install From Source
 
 ```sh
 git clone https://github.com/syi0808/crebro.git
