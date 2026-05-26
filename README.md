@@ -71,6 +71,34 @@ Crebro consumes the tags locally, registers the inner value as a normal
 encrypted in-memory secret capsule, and forwards only a Crebro placeholder
 upstream. v0.1 intentionally has no naming or reference syntax.
 
+### Placeholder guidance
+
+When a request is redacted, Crebro adds a short schema-aware instruction
+telling the LLM to reuse `{{CREBRO_SECRET:...}}` placeholders verbatim in
+commands, code, config, and shell snippets. This helps the local response
+restore path replace placeholders back to the original secret before the child
+agent sees the answer.
+
+The default instruction text is managed in
+`prompts/placeholder-guidance.md` and is compiled into the binary. It does not
+include raw secrets.
+
+Disable this behavior with:
+
+```sh
+crebro --no-placeholder-guidance -- codex
+```
+
+or:
+
+```sh
+CREBRO_NO_PLACEHOLDER_GUIDANCE=true crebro -- codex
+```
+
+Redaction still runs when placeholder guidance is disabled; the LLM may simply
+be more likely to replace placeholders with generic examples such as
+`<your token>`.
+
 ## Credential Pattern Rules
 
 Built-in discovery and detector rules live in `patterns/credentials.toml`.
@@ -125,6 +153,7 @@ The core scenario test suite covers:
 - user-declared `<cb>...</cb>` secret directives, including malformed directive rejection
 - TOML-backed env/.env discovery and credential detector rules
 - `require_explicit_secret` rejection for unregistered credential-like request values
+- placeholder guidance injection from `prompts/placeholder-guidance.md` and `--no-placeholder-guidance` disable behavior
 - local stats recording for redacted placeholder ids and unregistered pattern ids without raw secrets
 - longest-match-first overlap handling, including later-starting longer spans
 - registry-empty streaming fast path that forwards bytes unchanged

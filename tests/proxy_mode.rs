@@ -158,6 +158,7 @@ async fn cli_proxy_mode_runs_child_with_proxy_environment_without_upstream_url()
         patterns_file: None,
         stats_dir: None,
         tls_keylog_file: None,
+        no_placeholder_guidance: false,
         mode: RuntimeMode::Proxy,
         command: vec![
             "/bin/sh".to_string(),
@@ -184,6 +185,7 @@ async fn cli_proxy_mode_accepts_upstream_tls_keylog_file_configuration() {
         patterns_file: None,
         stats_dir: None,
         tls_keylog_file: Some(keylog_path.clone()),
+        no_placeholder_guidance: false,
         mode: RuntimeMode::Proxy,
         command: vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
     })
@@ -242,6 +244,7 @@ async fn proxy_mitm_websocket_redacts_request_and_restores_response() {
         let frame = read_ws_frame(&mut stream, true).await;
         let text = String::from_utf8(frame).unwrap();
         assert!(!text.contains(secret));
+        assert!(text.contains("Crebro replaced local secrets with safe placeholders"));
         assert!(text.contains("{{CREBRO_SECRET:v1:WS_SECRET:"));
 
         let response = format!(r#"{{"restored":"{expected_placeholder}"}}"#);
@@ -411,6 +414,7 @@ async fn proxy_mitm_websocket_auto_redacts_cloudflare_user_token() {
 
     let forwarded_payload = payload_rx.await.unwrap();
     assert!(!forwarded_payload.contains(cloudflare_token));
+    assert!(forwarded_payload.contains("Crebro replaced local secrets with safe placeholders"));
     assert!(forwarded_payload.contains("{{CREBRO_SECRET:v1:AUTO_CLOUDFLARE_USER_TOKEN:"));
     upstream.await.unwrap();
 }
@@ -642,7 +646,19 @@ where
     stream.read_exact(&mut header).await.unwrap();
     assert_eq!(header[0] & 0x0f, 1);
     assert_eq!(header[1] & 0x80 != 0, masked);
-    let len = (header[1] & 0x7f) as usize;
+    let len = match header[1] & 0x7f {
+        126 => {
+            let mut extended = [0u8; 2];
+            stream.read_exact(&mut extended).await.unwrap();
+            u16::from_be_bytes(extended) as usize
+        }
+        127 => {
+            let mut extended = [0u8; 8];
+            stream.read_exact(&mut extended).await.unwrap();
+            usize::try_from(u64::from_be_bytes(extended)).unwrap()
+        }
+        len => len as usize,
+    };
     let mut mask = [0u8; 4];
     if masked {
         stream.read_exact(&mut mask).await.unwrap();

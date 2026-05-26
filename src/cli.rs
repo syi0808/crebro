@@ -46,6 +46,9 @@ pub struct Cli {
     #[arg(long, env = "CREBRO_TLS_KEYLOG_FILE")]
     pub tls_keylog_file: Option<std::path::PathBuf>,
 
+    #[arg(long, env = "CREBRO_NO_PLACEHOLDER_GUIDANCE")]
+    pub no_placeholder_guidance: bool,
+
     #[arg(long, env = "CREBRO_MODE", value_enum, default_value_t = RuntimeMode::Auto)]
     pub mode: RuntimeMode,
 
@@ -107,6 +110,7 @@ pub async fn run_with_cli(mut cli: Cli) -> Result<i32> {
             registry: Arc::new(RwLock::new(registry)),
             patterns: Arc::clone(&patterns),
             tls_keylog_file: cli.tls_keylog_file,
+            placeholder_guidance: !cli.no_placeholder_guidance,
             ..ProxyConfig::default()
         })
         .await?;
@@ -142,6 +146,7 @@ pub async fn run_with_cli(mut cli: Cli) -> Result<i32> {
             patterns,
             stats_path: stats::stats_path(cli.stats_dir.as_deref()),
             tls_keylog_file: cli.tls_keylog_file,
+            placeholder_guidance: !cli.no_placeholder_guidance,
         },
         Arc::new(RwLock::new(registry)),
     )

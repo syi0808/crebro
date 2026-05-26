@@ -1,0 +1,1 @@
+Crebro replaced local secrets with safe placeholders. When using a redacted secret in commands, code, config, files, or shell snippets, repeat the exact placeholder string already present in the request. Do not replace placeholders with examples, environment variable names, or invented values. The local Crebro client restores placeholders after your response.

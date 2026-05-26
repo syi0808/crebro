@@ -45,6 +45,7 @@ pub struct GatewayConfig {
     pub patterns: Arc<CredentialPatternSet>,
     pub stats_path: Option<PathBuf>,
     pub tls_keylog_file: Option<PathBuf>,
+    pub placeholder_guidance: bool,
 }
 
 impl Default for GatewayConfig {
@@ -58,6 +59,7 @@ impl Default for GatewayConfig {
             patterns: CredentialPatternSet::builtin(),
             stats_path: None,
             tls_keylog_file: None,
+            placeholder_guidance: true,
         }
     }
 }
@@ -113,10 +115,13 @@ pub async fn spawn_gateway(
     let client = build_upstream_client(config.tls_keylog_file.as_deref())?;
     let state = AppState {
         registry,
-        sanitizer: Arc::new(Mutex::new(JsonSanitizer::with_patterns(
-            config.cache_entries,
-            Arc::clone(&config.patterns),
-        ))),
+        sanitizer: Arc::new(Mutex::new(
+            JsonSanitizer::with_patterns_and_placeholder_guidance(
+                config.cache_entries,
+                Arc::clone(&config.patterns),
+                config.placeholder_guidance,
+            ),
+        )),
         upstream_base: config.upstream_base,
         provider_auth_secret: config.provider_auth_secret,
         streaming_json_threshold_bytes: config.streaming_json_threshold_bytes,

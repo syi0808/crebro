@@ -15,6 +15,9 @@ use super::{
     field_policy::{FieldAction, FieldPolicy},
 };
 
+const PLACEHOLDER_GUIDANCE_MARKER: &str = "Crebro replaced local secrets with safe placeholders";
+const PLACEHOLDER_GUIDANCE: &str = include_str!("../../prompts/placeholder-guidance.md");
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SanitizerReport {
     pub input_bytes: usize,
@@ -29,6 +32,7 @@ pub struct JsonSanitizer {
     cache: RedactionCache,
     field_policy: FieldPolicy,
     patterns: Arc<CredentialPatternSet>,
+    placeholder_guidance: bool,
 }
 
 #[derive(Default)]
@@ -90,10 +94,19 @@ impl JsonSanitizer {
     }
 
     pub fn with_patterns(max_cache_entries: usize, patterns: Arc<CredentialPatternSet>) -> Self {
+        Self::with_patterns_and_placeholder_guidance(max_cache_entries, patterns, true)
+    }
+
+    pub fn with_patterns_and_placeholder_guidance(
+        max_cache_entries: usize,
+        patterns: Arc<CredentialPatternSet>,
+        placeholder_guidance: bool,
+    ) -> Self {
         Self {
             cache: RedactionCache::new(max_cache_entries),
             field_policy: FieldPolicy,
             patterns,
+            placeholder_guidance,
         }
     }
 
@@ -131,6 +144,7 @@ impl JsonSanitizer {
             unregistered_pattern_ids: Vec::new(),
         };
         self.sanitize_value(&mut value, registry, &mut Vec::new(), &mut report)?;
+        self.inject_placeholder_guidance_if_needed(&mut value, &report);
         let out = serde_json::to_vec(&value)?;
         report.output_bytes = out.len();
         report.cache_stats = self.cache.stats();
@@ -357,6 +371,16 @@ impl JsonSanitizer {
         registry: &mut SecretRegistry,
     ) -> Result<bool> {
         auto_register_pattern_matches(&self.patterns, text, registry)
+    }
+
+    fn inject_placeholder_guidance_if_needed(&self, value: &mut Value, report: &SanitizerReport) {
+        if !self.placeholder_guidance
+            || report.redacted_secret_ids.is_empty()
+            || contains_placeholder_guidance(value)
+        {
+            return;
+        }
+        inject_placeholder_guidance(value);
     }
 
     fn sanitize_value(
@@ -661,6 +685,170 @@ fn auto_register_pattern_matches(
         registered = true;
     }
     Ok(registered)
+}
+
+fn contains_placeholder_guidance(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains(PLACEHOLDER_GUIDANCE_MARKER),
+        Value::Array(items) => items.iter().any(contains_placeholder_guidance),
+        Value::Object(map) => map.values().any(contains_placeholder_guidance),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+fn inject_placeholder_guidance(value: &mut Value) -> bool {
+    let Value::Object(map) = value else {
+        return false;
+    };
+
+    if let Some(Value::Object(response)) = map.get_mut("response")
+        && inject_placeholder_guidance_into_object(response)
+    {
+        return true;
+    }
+
+    inject_placeholder_guidance_into_object(map)
+}
+
+fn inject_placeholder_guidance_into_object(map: &mut serde_json::Map<String, Value>) -> bool {
+    if map.contains_key("system") || map.contains_key("anthropic_version") {
+        return prepend_system_field(map);
+    }
+    if map.contains_key("system_instruction") || map.contains_key("contents") {
+        return prepend_system_instruction_field(map);
+    }
+    if map.contains_key("instructions") || map.contains_key("input") {
+        return prepend_instructions_field(map);
+    }
+    if prepend_messages_field(map) {
+        return true;
+    }
+    if let Some(Value::String(prompt)) = map.get_mut("prompt") {
+        prepend_text(prompt);
+        return true;
+    }
+    false
+}
+
+fn prepend_system_field(map: &mut serde_json::Map<String, Value>) -> bool {
+    match map.get_mut("system") {
+        Some(Value::String(system)) => {
+            prepend_text(system);
+            true
+        }
+        Some(Value::Array(blocks)) => {
+            blocks.insert(
+                0,
+                serde_json::json!({
+                    "type": "text",
+                    "text": PLACEHOLDER_GUIDANCE,
+                }),
+            );
+            true
+        }
+        Some(_) => false,
+        None => {
+            map.insert(
+                "system".to_string(),
+                Value::String(PLACEHOLDER_GUIDANCE.to_string()),
+            );
+            true
+        }
+    }
+}
+
+fn prepend_system_instruction_field(map: &mut serde_json::Map<String, Value>) -> bool {
+    match map.get_mut("system_instruction") {
+        Some(Value::Object(system_instruction)) => {
+            match system_instruction.get_mut("parts") {
+                Some(Value::Array(parts)) => {
+                    parts.insert(0, serde_json::json!({ "text": PLACEHOLDER_GUIDANCE }));
+                }
+                _ => {
+                    system_instruction.insert(
+                        "parts".to_string(),
+                        Value::Array(vec![serde_json::json!({ "text": PLACEHOLDER_GUIDANCE })]),
+                    );
+                }
+            }
+            true
+        }
+        Some(Value::String(system_instruction)) => {
+            prepend_text(system_instruction);
+            true
+        }
+        Some(_) => false,
+        None => {
+            map.insert(
+                "system_instruction".to_string(),
+                serde_json::json!({ "parts": [{ "text": PLACEHOLDER_GUIDANCE }] }),
+            );
+            true
+        }
+    }
+}
+
+fn prepend_instructions_field(map: &mut serde_json::Map<String, Value>) -> bool {
+    match map.get_mut("instructions") {
+        Some(Value::String(instructions)) => {
+            prepend_text(instructions);
+            true
+        }
+        Some(_) => false,
+        None => {
+            map.insert(
+                "instructions".to_string(),
+                Value::String(PLACEHOLDER_GUIDANCE.to_string()),
+            );
+            true
+        }
+    }
+}
+
+fn prepend_messages_field(map: &mut serde_json::Map<String, Value>) -> bool {
+    let Some(Value::Array(messages)) = map.get_mut("messages") else {
+        return false;
+    };
+    for message in messages {
+        let Value::Object(message) = message else {
+            continue;
+        };
+        if prepend_message_content(message) {
+            return true;
+        }
+    }
+    false
+}
+
+fn prepend_message_content(message: &mut serde_json::Map<String, Value>) -> bool {
+    match message.get_mut("content") {
+        Some(Value::String(content)) => {
+            prepend_text(content);
+            true
+        }
+        Some(Value::Array(blocks)) => {
+            blocks.insert(
+                0,
+                serde_json::json!({
+                    "type": "text",
+                    "text": PLACEHOLDER_GUIDANCE,
+                }),
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+fn prepend_text(text: &mut String) {
+    if text.is_empty() {
+        text.push_str(PLACEHOLDER_GUIDANCE);
+    } else {
+        let original = std::mem::take(text);
+        text.push_str(PLACEHOLDER_GUIDANCE);
+        text.push_str("\n\n");
+        text.push_str(&original);
+    }
 }
 
 fn is_cacheable_object_path(path: &[String]) -> bool {

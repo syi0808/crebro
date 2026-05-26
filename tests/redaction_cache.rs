@@ -486,6 +486,99 @@ fn built_in_auto_redacts_cloudflare_user_token() {
 }
 
 #[test]
+fn placeholder_guidance_is_injected_when_redaction_occurs() {
+    let prompt = include_str!("../prompts/placeholder-guidance.md");
+    let mut registry = registry_with("GITHUB_TOKEN", b"ghp_real_secret_1234567890");
+    let mut sanitizer = JsonSanitizer::new(64);
+    let payload = json!({
+        "messages": [{"role": "user", "content": "send ghp_real_secret_1234567890"}]
+    });
+
+    let (out, report) = sanitizer
+        .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
+        .unwrap();
+    let out_value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let out_text = String::from_utf8(out).unwrap();
+
+    assert_eq!(out_value["messages"][0]["role"], "user");
+    assert!(
+        out_value["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(prompt)
+    );
+    assert!(!out_text.contains("ghp_real_secret_1234567890"));
+    assert!(out_text.contains("{{CREBRO_SECRET:v1:GITHUB_TOKEN:"));
+    assert!(!report.redacted_secret_ids.is_empty());
+}
+
+#[test]
+fn placeholder_guidance_can_be_disabled() {
+    let mut registry = registry_with("GITHUB_TOKEN", b"ghp_real_secret_1234567890");
+    let mut sanitizer = JsonSanitizer::with_patterns_and_placeholder_guidance(
+        64,
+        CredentialPatternSet::builtin(),
+        false,
+    );
+    let payload = json!({
+        "messages": [{"role": "user", "content": "send ghp_real_secret_1234567890"}]
+    });
+
+    let (out, report) = sanitizer
+        .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
+        .unwrap();
+    let out_text = String::from_utf8(out).unwrap();
+
+    assert!(!out_text.contains("Crebro replaced local secrets with safe placeholders"));
+    assert!(!out_text.contains("ghp_real_secret_1234567890"));
+    assert!(out_text.contains("{{CREBRO_SECRET:v1:GITHUB_TOKEN:"));
+    assert!(!report.redacted_secret_ids.is_empty());
+}
+
+#[test]
+fn placeholder_guidance_uses_instructions_for_responses_payloads() {
+    let prompt = include_str!("../prompts/placeholder-guidance.md");
+    let mut registry = registry_with("OPENAI_API_KEY", b"openai-test-secret-1234567890");
+    let mut sanitizer = JsonSanitizer::new(64);
+    let payload = json!({
+        "input": [{"role": "user", "content": "use openai-test-secret-1234567890"}]
+    });
+
+    let (out, _) = sanitizer
+        .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
+        .unwrap();
+    let out_value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+    assert_eq!(out_value["instructions"], prompt);
+    assert!(
+        out_value["input"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("{{CREBRO_SECRET:v1:OPENAI_API_KEY:")
+    );
+}
+
+#[test]
+fn placeholder_guidance_falls_back_to_prompt_field() {
+    let prompt = include_str!("../prompts/placeholder-guidance.md");
+    let mut registry = registry_with("PROMPT_TOKEN", b"prompt-secret-1234567890");
+    let mut sanitizer = JsonSanitizer::new(64);
+    let payload = json!({
+        "prompt": "use prompt-secret-1234567890"
+    });
+
+    let (out, _) = sanitizer
+        .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
+        .unwrap();
+    let out_value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let prompt_value = out_value["prompt"].as_str().unwrap();
+
+    assert!(prompt_value.starts_with(prompt));
+    assert!(!prompt_value.contains("prompt-secret-1234567890"));
+    assert!(prompt_value.contains("{{CREBRO_SECRET:v1:PROMPT_TOKEN:"));
+}
+
+#[test]
 fn built_in_structural_patterns_avoid_common_placeholders() {
     let cases = [
         "-----BEGIN PRIVATE KEY-----",

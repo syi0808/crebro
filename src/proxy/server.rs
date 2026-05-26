@@ -34,6 +34,7 @@ pub struct ProxyConfig {
     pub mitm: bool,
     pub upstream_tls: bool,
     pub tls_keylog_file: Option<PathBuf>,
+    pub placeholder_guidance: bool,
     pub ca: Option<Arc<LocalCa>>,
 }
 
@@ -49,6 +50,7 @@ impl std::fmt::Debug for ProxyConfig {
             .field("mitm", &self.mitm)
             .field("upstream_tls", &self.upstream_tls)
             .field("tls_keylog_file", &self.tls_keylog_file)
+            .field("placeholder_guidance", &self.placeholder_guidance)
             .field("ca_configured", &self.ca.is_some())
             .finish_non_exhaustive()
     }
@@ -65,6 +67,7 @@ impl Default for ProxyConfig {
             mitm: true,
             upstream_tls: true,
             tls_keylog_file: None,
+            placeholder_guidance: true,
             ca: None,
         }
     }
@@ -139,10 +142,13 @@ pub async fn spawn_proxy(config: ProxyConfig) -> Result<ProxyHandle> {
     let state = ProxyState {
         allowlisted_connect_targets: Arc::new(allowlisted_connect_targets),
         registry: config.registry,
-        sanitizer: Arc::new(Mutex::new(JsonSanitizer::with_patterns(
-            config.cache_entries,
-            config.patterns,
-        ))),
+        sanitizer: Arc::new(Mutex::new(
+            JsonSanitizer::with_patterns_and_placeholder_guidance(
+                config.cache_entries,
+                config.patterns,
+                config.placeholder_guidance,
+            ),
+        )),
         mitm: config.mitm,
         upstream_tls: config.upstream_tls,
         upstream_key_log,
