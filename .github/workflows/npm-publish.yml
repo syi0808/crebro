@@ -51,10 +51,10 @@ jobs:
             linux_musl: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
@@ -80,7 +80,7 @@ jobs:
       - name: Publish native package
         shell: bash
         run: |
-          set -euo pipefail
+          set -eo pipefail
 
           version="${{ inputs.release_version }}"
           dry_run="${{ inputs.dry_run }}"
@@ -107,10 +107,10 @@ jobs:
     needs: publish-native
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
@@ -128,7 +128,7 @@ jobs:
       - name: Publish wrapper package
         shell: bash
         run: |
-          set -euo pipefail
+          set -eo pipefail
 
           version="${{ inputs.release_version }}"
           dry_run="${{ inputs.dry_run }}"
