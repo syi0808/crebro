@@ -65,6 +65,12 @@ Evidence from that run is included below.
 cargo install crebro
 ```
 
+### Install From npm
+
+```sh
+npm install -g crebro
+```
+
 ### Install From Source
 
 ```sh

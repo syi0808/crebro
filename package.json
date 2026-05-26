@@ -1,0 +1,12 @@
+{
+  "name": "crebro-release-tools",
+  "private": true,
+  "description": "Local release tooling for Crebro.",
+  "scripts": {
+    "npm:stage": "node scripts/build-npm-package.mjs --package current --package crebro",
+    "npm:pack": "node scripts/build-npm-package.mjs --package current --package crebro --pack-output-dir dist/npm",
+    "npm:publish:dry-run": "node scripts/build-npm-package.mjs --package current --package crebro --publish --dry-run",
+    "npm:publish": "node scripts/build-npm-package.mjs --package current --package crebro --publish"
+  },
+  "packageManager": "npm@11.5.1"
+}

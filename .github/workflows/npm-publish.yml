@@ -1,0 +1,150 @@
+name: Publish npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Version override. Empty uses Cargo.toml."
+        required: false
+        type: string
+      dry_run:
+        description: "Run npm publish with --dry-run"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish-native:
+    name: Publish ${{ matrix.package }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: crebro-linux-x64
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl
+            linux_musl: true
+          - package: crebro-linux-arm64
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            linux_musl: true
+          - package: crebro-darwin-x64
+            runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            linux_musl: false
+          - package: crebro-darwin-arm64
+            runner: macos-14
+            rust_target: aarch64-apple-darwin
+            linux_musl: false
+          - package: crebro-win32-x64
+            runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            linux_musl: false
+          - package: crebro-win32-arm64
+            runner: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+            linux_musl: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Linux musl target
+        if: ${{ matrix.linux_musl }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add "${{ matrix.rust_target }}"
+
+      - name: Check release scripts
+        shell: bash
+        run: |
+          node --check scripts/build-npm-package.mjs
+          node --check npm/bin/crebro.js
+
+      - name: Publish native package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${{ inputs.release_version }}"
+          dry_run="${{ inputs.dry_run }}"
+
+          version_args=()
+          publish_args=(--publish)
+
+          if [[ -n "$version" ]]; then
+            version_args=(--release-version "$version")
+          fi
+
+          if [[ "$dry_run" == "true" ]]; then
+            publish_args+=(--dry-run)
+          fi
+
+          node scripts/build-npm-package.mjs \
+            --package "${{ matrix.package }}" \
+            "${version_args[@]}" \
+            "${publish_args[@]}"
+
+  publish-wrapper:
+    name: Publish wrapper
+    runs-on: ubuntu-latest
+    needs: publish-native
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check release scripts
+        shell: bash
+        run: |
+          node --check scripts/build-npm-package.mjs
+          node --check npm/bin/crebro.js
+
+      - name: Publish wrapper package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${{ inputs.release_version }}"
+          dry_run="${{ inputs.dry_run }}"
+
+          version_args=()
+          publish_args=(--publish)
+
+          if [[ -n "$version" ]]; then
+            version_args=(--release-version "$version")
+          fi
+
+          if [[ "$dry_run" == "true" ]]; then
+            publish_args+=(--dry-run)
+          fi
+
+          node scripts/build-npm-package.mjs \
+            --package crebro \
+            "${version_args[@]}" \
+            "${publish_args[@]}"

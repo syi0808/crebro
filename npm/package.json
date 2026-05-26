@@ -1,0 +1,27 @@
+{
+  "name": "crebro",
+  "version": "0.0.0-dev",
+  "description": "Local credential broker for coding agents that redacts secrets before LLM provider requests.",
+  "license": "Apache-2.0",
+  "bin": {
+    "crebro": "bin/crebro.js"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=16"
+  },
+  "files": [
+    "bin/crebro.js"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/syi0808/crebro.git"
+  },
+  "keywords": [
+    "credentials",
+    "proxy",
+    "llm",
+    "redaction",
+    "security"
+  ]
+}
