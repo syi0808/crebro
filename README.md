@@ -1,87 +1,143 @@
-# Crebro
+# Crebro - Credential Broker
 
-Crebro v0.1 is a zero-config local LLM API redaction gateway for coding agents.
+Crebro is a local credential firewall for coding agents, starting with Codex, that keeps secrets out of external LLM requests.
 
-Core principles:
+## What It Does
 
-- zero-config
-- one-shot process
-- in-memory only
-- no persistent secret storage
-- no daemon
-- native LLM gateway by default
-- local child-scoped proxy mode for agent auth paths that cannot use native gateway routing
-- plaintext-minimized secret handling
-- large-context optimized redaction
+Credentials should stay local. Crebro's position is that API keys, tokens, passwords, and manually marked secrets should not be sent to an external LLM just because they appeared in a prompt, config file, environment variable, or tool context.
 
-## Usage
+Crebro runs as a one-shot wrapper around a child agent process:
 
 ```sh
 crebro -- codex
 ```
 
-Crebro starts a loopback gateway, launches the child command, points common provider base URL variables at the gateway, removes raw provider keys from the child environment, and exits with the child status. It infers default upstream URLs for `codex`, `claude`, `gemini`, and `opencode`; pass `--upstream-url` or set `CREBRO_UPSTREAM_URL` to override that default.
+It starts a loopback gateway or local proxy, launches the child command, routes supported provider traffic through Crebro, redacts discovered secrets before the request reaches the upstream LLM provider, and restores Crebro placeholders in the local response stream before the child agent sees the answer.
 
-Mode selection can be forced with:
+The current implementation focuses on:
 
-```sh
-crebro --mode native -- codex
-crebro --mode proxy -- codex
-```
+- zero-config first
+- in-memory secret handling
+- no persistent secret storage
+- environment and `.env` credential discovery
+- exact-match redaction for managed secrets
+- user-declared secrets with `<cb>...</cb>`
+- placeholder restoration in responses
 
-`native` is the existing provider API gateway path. `proxy` starts a local
-explicit proxy and injects proxy environment variables into the child process.
-Proxy mode supports Codex ChatGPT auth traffic, where Codex calls
-`chatgpt.com/backend-api` directly instead of honoring `OPENAI_BASE_URL`.
+## What It Does Not Do
 
-Current proxy-mode implementation handles allowlisted `CONNECT` traffic with a
-session local CA, downstream TLS termination, WebSocket handshake forwarding,
-WebSocket text-frame redaction/restore, and content-length-delimited HTTP
-JSON/text body redaction/restore. It does not hide Codex ChatGPT session
-credentials from Codex or from `chatgpt.com`, and it does not install
-system-wide trust.
+Crebro is not a full security boundary.
+
+- It does not protect against privileged memory inspection, kernel-level attackers, malicious local processes, or secrets that already exist in your shell, files, terminal, or child agent process.
+- It does not provide semantic detection for every possible secret-like value. current targets exact-match redaction of known, discovered, or explicitly declared secrets.
+- It does not install system-wide trust. Proxy mode uses a session-local CA for the wrapped child process.
+- It does not claim full provider certification yet.
+- It does not replace normal secret hygiene, provider-side access controls, or outbound network monitoring.
+
+## Test
+
+The current public test target is Codex.
 
 Verified local routing surfaces:
 
-- Codex CLI 0.133.0: OpenAI-compatible routing through `OPENAI_BASE_URL`; ChatGPT auth proxy mode through child-scoped proxy env and `chatgpt.com/backend-api`.
-- Claude Code 2.1.112: Anthropic-compatible routing through `ANTHROPIC_BASE_URL` and `CLAUDE_CODE_API_BASE_URL`.
-- Gemini CLI 0.42.0: Gemini API-key routing through `GOOGLE_GEMINI_BASE_URL`.
-- OpenCode 1.15.4: OpenAI/Anthropic provider routing through `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`.
+- Codex CLI 0.133.0 using OpenAI-compatible routing through `OPENAI_BASE_URL`
+- Codex ChatGPT auth traffic through child-scoped proxy environment variables and `chatgpt.com/backend-api`
 
-## Secret Handling
+## Install
 
-Crebro does not store secrets on disk.
+Crebro is currently installed from source.
 
-During a session, Crebro avoids keeping plaintext secrets in its registry or long-lived heap state. Secrets are ingested into secure buffers, converted into encrypted in-memory capsules and matching fingerprints, then zeroized.
+### Requirements
 
-Request redaction uses fingerprints instead of plaintext secret tables. Response restoration decrypts a secret capsule only at the moment a placeholder needs to be restored, writes the bytes to the local response stream, and immediately zeroizes the scratch buffer.
+- Rust toolchain with Rust 2024 edition support
+- A supported child agent command, such as `codex`
 
-Crebro disables common core dump paths where supported, but it cannot protect against privileged live memory inspection, kernel-level attackers, or plaintext secrets that already exist in your shell, OS environment, project files, or local agent process.
+### Build And Install
 
-### User-declared secrets
+```sh
+git clone https://github.com/syi0808/crebro.git
+cd crebro
+cargo install --path .
+```
 
-If automatic discovery cannot know that a prompt fragment is sensitive, wrap it
-with `<cb>...</cb>` inside the agent prompt:
+### Verify
+
+```sh
+crebro --version
+crebro --help
+```
+
+## Usage
+
+### Basic Codex Wrapper
+
+```sh
+crebro -- codex
+```
+
+Crebro launches `codex`, removes raw provider keys from the child environment, sets provider base URL variables to the local Crebro gateway, and exits with the child process status.
+
+### Automatic Routing Choice
+
+```sh
+crebro -- codex
+```
+
+Crebro does not ask the user to choose a routing mode. It uses the native provider gateway path when the child command can be routed through provider base URL variables. When Codex is running through ChatGPT auth and there is no provider API key, Crebro uses a child-scoped local proxy because that traffic does not honor `OPENAI_BASE_URL`.
+
+The proxy path starts a local explicit proxy, injects proxy environment variables into the child process, and uses a session-local CA for allowlisted MITM traffic. This is an implementation detail driven by the agent's auth path, not a feature toggle the user is expected to manage.
+
+### Upstream URL
+
+Crebro infers the default upstream URL for supported commands. Override it when needed:
+
+```sh
+crebro --upstream-url https://api.openai.com -- codex
+```
+
+or:
+
+```sh
+CREBRO_UPSTREAM_URL=https://api.openai.com crebro -- codex
+```
+
+### Provider API Key
+
+Crebro can read provider keys from the environment or from `--provider-api-key`.
+
+```sh
+CREBRO_PROVIDER_API_KEY=sk-example crebro -- codex
+```
+
+Known provider key variables include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, and `OPENCODE_API_KEY`.
+
+### Environment File
+
+By default, Crebro checks `.env` for credential candidates.
+
+```sh
+crebro --env-file .env.local -- codex
+```
+
+or:
+
+```sh
+CREBRO_ENV_FILE=.env.local crebro -- codex
+```
+
+### User-Declared Secrets
+
+If automatic discovery cannot know that a prompt fragment is sensitive, wrap it with `<cb>...</cb>` inside the agent prompt:
 
 ```text
 Use <cb>my-manual-secret</cb> for this local step.
 ```
 
-Crebro consumes the tags locally, registers the inner value as a normal
-encrypted in-memory secret capsule, and forwards only a Crebro placeholder
-upstream. v0.1 intentionally has no naming or reference syntax.
+Crebro consumes the tags locally, registers the inner value as an encrypted in-memory secret capsule, and forwards only a Crebro placeholder upstream.
 
-### Placeholder guidance
+### Placeholder Guidance
 
-When a request is redacted, Crebro adds a short schema-aware instruction
-telling the LLM to reuse `{{CREBRO_SECRET:...}}` placeholders verbatim in
-commands, code, config, and shell snippets. This helps the local response
-restore path replace placeholders back to the original secret before the child
-agent sees the answer.
-
-The default instruction text is managed in
-`prompts/placeholder-guidance.md` and is compiled into the binary. It does not
-include raw secrets.
+When Crebro redacts a request, it can add a short instruction asking the LLM to reuse `{{CREBRO_SECRET:...}}` placeholders verbatim in commands, code, config, and shell snippets. The default instruction text is compiled from `prompts/placeholder-guidance.md`.
 
 Disable this behavior with:
 
@@ -95,22 +151,11 @@ or:
 CREBRO_NO_PLACEHOLDER_GUIDANCE=true crebro -- codex
 ```
 
-Redaction still runs when placeholder guidance is disabled; the LLM may simply
-be more likely to replace placeholders with generic examples such as
-`<your token>`.
+Redaction still runs when placeholder guidance is disabled.
 
-## Credential Pattern Rules
+### Credential Pattern Rules
 
-Built-in discovery and detector rules live in `patterns/credentials.toml`.
-Crebro compiles this TOML into the binary for zero-config use.
-
-The TOML contains exact env keys, env/.env discovery markers, and request-time
-`credential_patterns`. Pattern entries use the explicit policy name
-`on_unregistered_match = "require_explicit_secret"` when a credential-looking
-value must not be forwarded unless it is already registered as a managed secret.
-Ambiguous identifiers or intentionally client-visible keys can use
-`on_unregistered_match = "allow"` so they are counted in local stats without
-blocking the request.
+Built-in discovery and detector rules live in `patterns/credentials.toml` and are compiled into the binary.
 
 Use a custom rule file with:
 
@@ -124,101 +169,27 @@ or:
 CREBRO_PATTERNS_FILE=./patterns/credentials.toml crebro -- codex
 ```
 
-## Local Stats
+Rules can reject unregistered credential-looking values, allow intentionally public identifiers, or auto-redact specific patterns.
 
-When launched through the CLI, Crebro writes best-effort local stats to
-`~/.crebro/stats.json`. Override the directory with `--stats-dir` or
-`CREBRO_STATS_DIR`.
+### Local Stats
 
-The stats file stores counts by Crebro placeholder id and credential pattern id.
-It does not store raw secrets, raw prompts, or raw responses.
+When launched through the CLI, Crebro writes best-effort local stats to `~/.crebro/stats.json`.
 
-## Large Context Redaction
+```sh
+crebro --stats-dir /tmp/crebro-stats -- codex
+```
 
-Crebro scans JSON string values and ordinary text-bearing fields. Repeated no-secret strings, redaction spans, recognized message objects, and tool schemas are cached with keyed hashes so repeated coding-agent context can skip full rescans.
+or:
 
-Known binary/base64 payload fields may be skipped for performance. v0.1 targets exact-match redaction of discovered known secrets, not semantic detection of every possible secret-like value.
+```sh
+CREBRO_STATS_DIR=/tmp/crebro-stats crebro -- codex
+```
 
-## Current QA Coverage
+The stats file stores counts by Crebro placeholder id and credential pattern id. It does not store raw secrets, raw prompts, or raw responses.
 
-The core scenario test suite covers:
+### TLS Key Logging For QA
 
-- plaintext-free registry state after ingest
-- encrypted capsules and just-in-time restore
-- source and scratch buffer zeroization paths
-- `.env` discovery source buffer zeroization after candidate extraction
-- registry debug output hides secret-derived fingerprints and lookup indexes
-- redaction cache and streaming sanitizer debug output hides cached prompt/string bytes
-- fingerprint-based redaction without a plaintext secret table
-- user-declared `<cb>...</cb>` secret directives, including malformed directive rejection
-- TOML-backed env/.env discovery and credential detector rules
-- `require_explicit_secret` rejection for unregistered credential-like request values
-- placeholder guidance injection from `prompts/placeholder-guidance.md` and `--no-placeholder-guidance` disable behavior
-- local stats recording for redacted placeholder ids and unregistered pattern ids without raw secrets
-- longest-match-first overlap handling, including later-starting longer spans
-- registry-empty streaming fast path that forwards bytes unchanged
-- no-secret and redaction-span cache reuse
-- bounded LRU cache eviction behavior
-- cache invalidation when the registry changes
-- provider message object and tool schema cache reuse
-- case-insensitive JSON content-type detection before request redaction
-- stale request `content-encoding` removal after JSON body redaction
-- large JSON request body streaming redaction
-- streaming sanitized request forwarding before the child request body finishes
-- provider auth restoration applies upstream headers without creating a plaintext `String`
-- Gemini v1 stable routes use Gemini API-key auth headers, not OpenAI bearer auth
-- provider route inference covers OpenAI, Anthropic, Gemini beta, and Gemini stable routes
-- upstream URL joining preserves path and query parameters
-- large-string chunk cache with boundary-spanning and overlapping secret spans
-- known binary/base64 field skipping in parsed and streaming JSON paths
-- message/object cache avoids storing subtrees with skipped binary/base64 fields
-- streaming placeholder restore across two- and three-chunk boundaries plus adjacent placeholders
-- gateway response restoration for placeholders split across upstream chunks
-- proxy chunked HTTP/SSE response restoration for placeholders split across HTTP chunks
-- proxy SSE delta restoration for placeholders split across separate stream events
-- proxy WebSocket JSON delta restoration for placeholders split across separate messages
-- stale `content-encoding` removal after response body restoration
-- gateway streams restored response chunks before the upstream response finishes
-- runtime registration of observed provider auth headers, including case-insensitive Bearer schemes and surrounding whitespace normalization
-- gateway roundtrip redaction before upstream and restoration back to the local child
-- one-shot CLI wrapper routing a child request through Crebro with mock upstream echo
-- child environment mediation so raw provider keys are not passed through unchanged
-- zero-config upstream URL inference for supported agent commands
-
-## Current Limits
-
-This implementation is a tested v0.1 core, not a completed provider certification pass.
-
-Remaining work before claiming full v0.1 first-class support:
-
-- run live end-to-end agent sessions against real upstream providers
-- verify process-level egress with a macOS outbound monitor such as Little Snitch or LuLu
-
-The local mock-based QA suite is passing. Live provider E2E was not run in this
-environment because no provider API key environment variables were set.
-
-The streaming request path avoids buffering the full raw request before JSON tokenization or upstream forwarding. It still buffers the current JSON string token while it is being rewritten; small JSON bodies are parsed in memory.
-
-## Manual Egress QA
-
-For live agent testing on macOS, use an outbound monitor/firewall to verify that
-the wrapped agent does not contact provider endpoints directly.
-
-Expected network shape:
-
-- `codex`, `claude`, `gemini`, or `opencode` may connect to `127.0.0.1` or `localhost`.
-- The wrapped agent should not connect directly to `api.openai.com`, `api.anthropic.com`, or `generativelanguage.googleapis.com`.
-- In Codex ChatGPT auth proxy mode, the wrapped `codex` process should not
-  connect directly to `chatgpt.com`; Crebro should be the process connecting
-  to `chatgpt.com`.
-- `crebro` is the process that may connect to the upstream provider endpoint.
-
-This proves process-level mediation, not HTTPS payload contents. To inspect
-request bodies and headers, point `--upstream-url` at a local recording upstream
-or use a dedicated HTTPS debugging proxy in a separate test profile.
-
-For Wireshark TLS decryption during live provider QA, enable Crebro-only TLS
-key logging:
+For isolated QA sessions, Crebro can write TLS key logs for its upstream HTTPS connections:
 
 ```sh
 CREBRO_TLS_KEYLOG_FILE=/tmp/crebro-tls.keys crebro -- codex
@@ -230,11 +201,22 @@ or:
 crebro --tls-keylog-file /tmp/crebro-tls.keys -- codex
 ```
 
-Then configure Wireshark's TLS `(Pre)-Master-Secret log filename` to the same
-file. This logs TLS traffic secrets for Crebro's upstream HTTPS connections and
-can reveal plaintext provider requests in the capture. Use it only in isolated
-QA sessions and delete the key log file after analysis.
+Use this only in controlled testing. Delete the key log file after analysis.
 
-For the full local E2E test setup, including the `crebro-qa-upstream` recorder
-and fail-close canary checks, see
-`docs/qa/e2e-test-environment.md`.
+## Frequently Asked Questions
+
+### Can Crebro guarantee that no secret ever leaves my machine?
+
+No. Crebro redacts known, discovered, or explicitly declared secrets before the upstream LLM request. It cannot protect against secrets already exposed to the child process, secrets not registered with Crebro, privileged local inspection, OS-level compromise, or an agent that sends data outside the routed path.
+
+### Does proxy mode decrypt my traffic?
+
+For allowlisted proxy targets, yes. Proxy mode uses local MITM so Crebro can redact request bodies and restore placeholders in responses. The CA is session-local and injected into the wrapped child process; Crebro does not install system-wide trust.
+
+### How was Crebro built?
+
+The product direction, architecture decisions, and real testing were done by a human. The implementation was vibe-coded with AI assistance and then checked against local tests and manual review.
+
+## License
+
+Crebro is licensed under the [Apache License 2.0](LICENSE).
