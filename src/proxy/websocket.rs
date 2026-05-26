@@ -4,7 +4,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    CrebroError, Result, redact::JsonSanitizer, restore::ResponseRestorer, secrets::SecretRegistry,
+    CrebroError, Result, redact::JsonSanitizer, restore::PlaceholderMatcher,
+    secrets::SecretRegistry,
 };
 
 const OPCODE_CONTINUATION: u8 = 0x0;
@@ -34,6 +35,7 @@ where
 {
     let mut client_text = MessageBuffer::default();
     let mut upstream_text = MessageBuffer::default();
+    let mut upstream_restorer: Option<WebSocketTextRestorer> = None;
 
     loop {
         tokio::select! {
@@ -62,6 +64,7 @@ where
                     client,
                     Arc::clone(&registry),
                     &mut upstream_text,
+                    &mut upstream_restorer,
                 ).await? {
                     return Ok(());
                 }
@@ -127,6 +130,7 @@ async fn handle_upstream_frame<W>(
     client: &mut W,
     registry: Arc<RwLock<SecretRegistry>>,
     buffer: &mut MessageBuffer,
+    restorer: &mut Option<WebSocketTextRestorer>,
 ) -> Result<bool>
 where
     W: AsyncWrite + Unpin,
@@ -134,7 +138,8 @@ where
     match frame.opcode {
         OPCODE_TEXT => {
             if frame.fin {
-                let payload = restore_upstream_text(payload_ref(&frame), &registry).await?;
+                let payload =
+                    restore_upstream_text(payload_ref(&frame), &registry, restorer).await?;
                 write_frame(client, true, OPCODE_TEXT, &payload, false).await?;
             } else {
                 buffer.active_opcode = Some(OPCODE_TEXT);
@@ -146,7 +151,7 @@ where
             if frame.fin {
                 let payload = std::mem::take(&mut buffer.payload);
                 buffer.active_opcode = None;
-                let payload = restore_upstream_text(&payload, &registry).await?;
+                let payload = restore_upstream_text(&payload, &registry, restorer).await?;
                 write_frame(client, true, OPCODE_TEXT, &payload, false).await?;
             }
         }
@@ -235,12 +240,206 @@ async fn sanitize_client_text(
 async fn restore_upstream_text(
     payload: &[u8],
     registry: &Arc<RwLock<SecretRegistry>>,
+    restorer: &mut Option<WebSocketTextRestorer>,
 ) -> Result<Vec<u8>> {
     let registry = registry.read().await;
-    let mut restorer = ResponseRestorer::new(&registry)?;
-    let mut out = restorer.push_chunk(payload, &registry)?;
-    out.extend(restorer.finish(&registry)?);
-    Ok(out)
+    let version = registry.version();
+    if restorer
+        .as_ref()
+        .is_none_or(|restorer| restorer.registry_version != version)
+    {
+        *restorer = Some(WebSocketTextRestorer::new(&registry)?);
+    }
+    let restorer = restorer
+        .as_mut()
+        .ok_or_else(|| CrebroError::Restore("missing websocket response restorer".into()))?;
+    restorer.restore_payload(payload, &registry)
+}
+
+struct WebSocketTextRestorer {
+    registry_version: u64,
+    text_restorer: PlaceholderFragmentRestorer,
+}
+
+impl WebSocketTextRestorer {
+    fn new(registry: &SecretRegistry) -> Result<Self> {
+        Ok(Self {
+            registry_version: registry.version(),
+            text_restorer: PlaceholderFragmentRestorer::new(registry)?,
+        })
+    }
+
+    fn restore_payload(&mut self, payload: &[u8], registry: &SecretRegistry) -> Result<Vec<u8>> {
+        if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(payload) {
+            restore_json_text_fields(&mut value, &mut self.text_restorer, registry)?;
+            return serde_json::to_vec(&value).map_err(Into::into);
+        }
+
+        let text = str::from_utf8(payload)
+            .map_err(|_| CrebroError::Gateway("websocket text frame was not UTF-8".into()))?;
+        Ok(self.text_restorer.push_text(text, registry)?.into_bytes())
+    }
+}
+
+struct PlaceholderFragmentRestorer {
+    matcher: PlaceholderMatcher,
+    placeholders: Vec<Vec<u8>>,
+    pending: Vec<u8>,
+}
+
+impl PlaceholderFragmentRestorer {
+    fn new(registry: &SecretRegistry) -> Result<Self> {
+        Ok(Self {
+            matcher: PlaceholderMatcher::new(registry)?,
+            placeholders: registry
+                .placeholders()
+                .into_iter()
+                .map(|(placeholder, _)| placeholder.into_bytes())
+                .collect(),
+            pending: Vec::new(),
+        })
+    }
+
+    fn push_text(&mut self, text: &str, registry: &SecretRegistry) -> Result<String> {
+        if self.placeholders.is_empty() {
+            return Ok(text.to_string());
+        }
+
+        let mut combined = std::mem::take(&mut self.pending);
+        combined.extend_from_slice(text.as_bytes());
+        let hold_len = placeholder_prefix_suffix_len(&combined, &self.placeholders);
+        let safe_len = combined.len().saturating_sub(hold_len);
+        let restored = self.restore_complete_placeholders(&combined[..safe_len], registry)?;
+        self.pending.extend_from_slice(&combined[safe_len..]);
+        String::from_utf8(restored)
+            .map_err(|_| CrebroError::Restore("restored websocket text is not UTF-8".into()))
+    }
+
+    fn restore_string_without_pending(
+        &self,
+        text: &str,
+        registry: &SecretRegistry,
+    ) -> Result<String> {
+        let restored = self.restore_complete_placeholders(text.as_bytes(), registry)?;
+        String::from_utf8(restored)
+            .map_err(|_| CrebroError::Restore("restored websocket text is not UTF-8".into()))
+    }
+
+    fn restore_complete_placeholders(
+        &self,
+        bytes: &[u8],
+        registry: &SecretRegistry,
+    ) -> Result<Vec<u8>> {
+        let matches = self.matcher.find_in(bytes);
+        if matches.is_empty() {
+            return Ok(bytes.to_vec());
+        }
+
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut cursor = 0usize;
+        for mat in matches {
+            if mat.start < cursor {
+                continue;
+            }
+            out.extend_from_slice(&bytes[cursor..mat.start]);
+            registry.restore_to_vec(mat.secret_id, &mut out)?;
+            cursor = mat.end;
+        }
+        out.extend_from_slice(&bytes[cursor..]);
+        Ok(out)
+    }
+}
+
+fn restore_json_text_fields(
+    value: &mut serde_json::Value,
+    restorer: &mut PlaceholderFragmentRestorer,
+    registry: &SecretRegistry,
+) -> Result<()> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if is_stream_text_field(key) {
+                    restore_stream_text_value(child, restorer, registry)?;
+                } else {
+                    restore_non_stream_value(child, restorer, registry)?;
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                restore_json_text_fields(item, restorer, registry)?;
+            }
+        }
+        serde_json::Value::String(text) => {
+            *text = restorer.restore_string_without_pending(text, registry)?;
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+    Ok(())
+}
+
+fn restore_non_stream_value(
+    value: &mut serde_json::Value,
+    restorer: &mut PlaceholderFragmentRestorer,
+    registry: &SecretRegistry,
+) -> Result<()> {
+    match value {
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+            restore_json_text_fields(value, restorer, registry)
+        }
+        serde_json::Value::String(text) => {
+            *text = restorer.restore_string_without_pending(text, registry)?;
+            Ok(())
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            Ok(())
+        }
+    }
+}
+
+fn restore_stream_text_value(
+    value: &mut serde_json::Value,
+    restorer: &mut PlaceholderFragmentRestorer,
+    registry: &SecretRegistry,
+) -> Result<()> {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = restorer.push_text(text, registry)?;
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                restore_stream_text_value(item, restorer, registry)?;
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for child in map.values_mut() {
+                restore_stream_text_value(child, restorer, registry)?;
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+    Ok(())
+}
+
+fn is_stream_text_field(key: &str) -> bool {
+    matches!(
+        key,
+        "content" | "delta" | "text" | "output_text" | "message"
+    )
+}
+
+fn placeholder_prefix_suffix_len(bytes: &[u8], placeholders: &[Vec<u8>]) -> usize {
+    let mut best = 0usize;
+    for placeholder in placeholders {
+        let max_len = bytes.len().min(placeholder.len().saturating_sub(1));
+        for len in (2..=max_len).rev() {
+            if bytes[bytes.len() - len..] == placeholder[..len] {
+                best = best.max(len);
+                break;
+            }
+        }
+    }
+    best
 }
 
 async fn read_frame<R>(reader: &mut R, expect_masked: bool) -> Result<Option<Frame>>

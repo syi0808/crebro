@@ -384,6 +384,20 @@ where
         })?;
         return Ok(());
     }
+    if is_chunked_transfer(response.head_without_delimiter()) {
+        if is_sse_http_body(response.head_without_delimiter())
+            && !has_header(response.head_without_delimiter(), "content-encoding")
+        {
+            forward_sse_chunked_http_response(&mut client, &mut upstream, response, &state).await?;
+        } else if is_redactable_http_body(response.head_without_delimiter())
+            && !has_header(response.head_without_delimiter(), "content-encoding")
+        {
+            forward_chunked_http_response(&mut client, &mut upstream, response, &state).await?;
+        } else {
+            forward_passthrough_http_response(&mut client, &mut upstream, response).await?;
+        }
+        return Ok(());
+    }
     read_remaining_body(&mut upstream, &mut response).await?;
     let response = restore_http_response(response, &state).await?;
     client.write_all(&response).await.map_err(|err| {
@@ -491,6 +505,439 @@ fn sanitize_http_body(
         .map_err(|_| CrebroError::Gateway("HTTP text body was not UTF-8".into()))?;
     let (sanitized, _report) = sanitizer.sanitize_text_payload(text, registry)?;
     Ok(sanitized.into_bytes())
+}
+
+async fn forward_chunked_http_response<C, R>(
+    client: &mut C,
+    upstream: &mut R,
+    response: HttpHead,
+    state: &ProxyState,
+) -> Result<()>
+where
+    C: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let head = rewrite_http_head_for_chunked(response.head_without_delimiter())?;
+    client.write_all(&head).await.map_err(|err| {
+        CrebroError::Gateway(format!(
+            "failed to write downstream HTTP response head: {err}"
+        ))
+    })?;
+    client.write_all(b"\r\n").await.map_err(|err| {
+        CrebroError::Gateway(format!(
+            "failed to finish downstream HTTP response head: {err}"
+        ))
+    })?;
+
+    let registry = state.registry.read().await;
+    let mut restorer = crate::restore::ResponseRestorer::new(&registry)?;
+    let mut pending = response.extra_bytes().to_vec();
+
+    loop {
+        let line = read_chunk_line(upstream, &mut pending).await?;
+        let chunk_len = parse_chunk_len(&line)?;
+        if chunk_len == 0 {
+            read_chunk_trailers(upstream, &mut pending).await?;
+            let tail = restorer.finish(&registry)?;
+            write_http_chunk(client, &tail).await?;
+            client.write_all(b"0\r\n\r\n").await.map_err(|err| {
+                CrebroError::Gateway(format!("failed to write final HTTP chunk: {err}"))
+            })?;
+            return Ok(());
+        }
+
+        let chunk = read_exact_pending(upstream, &mut pending, chunk_len).await?;
+        let delimiter = read_exact_pending(upstream, &mut pending, 2).await?;
+        if delimiter.as_slice() != b"\r\n" {
+            return Err(CrebroError::Gateway(
+                "invalid chunked HTTP response delimiter".into(),
+            ));
+        }
+        let restored = restorer.push_chunk(&chunk, &registry)?;
+        write_http_chunk(client, &restored).await?;
+    }
+}
+
+async fn forward_sse_chunked_http_response<C, R>(
+    client: &mut C,
+    upstream: &mut R,
+    response: HttpHead,
+    state: &ProxyState,
+) -> Result<()>
+where
+    C: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let head = rewrite_http_head_for_chunked(response.head_without_delimiter())?;
+    client.write_all(&head).await.map_err(|err| {
+        CrebroError::Gateway(format!(
+            "failed to write downstream HTTP response head: {err}"
+        ))
+    })?;
+    client.write_all(b"\r\n").await.map_err(|err| {
+        CrebroError::Gateway(format!(
+            "failed to finish downstream HTTP response head: {err}"
+        ))
+    })?;
+
+    let registry = state.registry.read().await;
+    let mut restorer = SseStreamRestorer::new(&registry)?;
+    let mut pending = response.extra_bytes().to_vec();
+
+    loop {
+        let line = read_chunk_line(upstream, &mut pending).await?;
+        let chunk_len = parse_chunk_len(&line)?;
+        if chunk_len == 0 {
+            read_chunk_trailers(upstream, &mut pending).await?;
+            let tail = restorer.finish(&registry)?;
+            write_http_chunk(client, &tail).await?;
+            client.write_all(b"0\r\n\r\n").await.map_err(|err| {
+                CrebroError::Gateway(format!("failed to write final HTTP chunk: {err}"))
+            })?;
+            return Ok(());
+        }
+
+        let chunk = read_exact_pending(upstream, &mut pending, chunk_len).await?;
+        let delimiter = read_exact_pending(upstream, &mut pending, 2).await?;
+        if delimiter.as_slice() != b"\r\n" {
+            return Err(CrebroError::Gateway(
+                "invalid chunked HTTP response delimiter".into(),
+            ));
+        }
+        let restored = restorer.push_chunk(&chunk, &registry)?;
+        write_http_chunk(client, &restored).await?;
+    }
+}
+
+async fn forward_passthrough_http_response<C, R>(
+    client: &mut C,
+    upstream: &mut R,
+    response: HttpHead,
+) -> Result<()>
+where
+    C: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    client.write_all(&response.bytes).await.map_err(|err| {
+        CrebroError::Gateway(format!("failed to write downstream HTTP response: {err}"))
+    })?;
+    tokio::io::copy(upstream, client)
+        .await
+        .map_err(|err| CrebroError::Gateway(format!("failed to copy HTTP response: {err}")))?;
+    Ok(())
+}
+
+struct SseStreamRestorer {
+    event_buffer: Vec<u8>,
+    text_restorer: PlaceholderFragmentRestorer,
+}
+
+impl SseStreamRestorer {
+    fn new(registry: &SecretRegistry) -> Result<Self> {
+        Ok(Self {
+            event_buffer: Vec::new(),
+            text_restorer: PlaceholderFragmentRestorer::new(registry)?,
+        })
+    }
+
+    fn push_chunk(&mut self, chunk: &[u8], registry: &SecretRegistry) -> Result<Vec<u8>> {
+        self.event_buffer.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some((event_end, separator_len)) = find_sse_event_end(&self.event_buffer) {
+            let event = self.event_buffer[..event_end].to_vec();
+            self.event_buffer.drain(..event_end + separator_len);
+            out.extend(self.restore_event(&event, registry)?);
+            out.push(b'\n');
+            out.push(b'\n');
+        }
+        Ok(out)
+    }
+
+    fn finish(mut self, registry: &SecretRegistry) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        if !self.event_buffer.is_empty() {
+            let event = std::mem::take(&mut self.event_buffer);
+            out.extend(self.restore_event(&event, registry)?);
+        }
+        let tail = self.text_restorer.finish(registry)?;
+        if !tail.is_empty() {
+            out.extend_from_slice(b"\ndata: ");
+            out.extend_from_slice(&serde_json::to_vec(&serde_json::json!({ "delta": tail }))?);
+            out.push(b'\n');
+            out.push(b'\n');
+        }
+        Ok(out)
+    }
+
+    fn restore_event(&mut self, event: &[u8], registry: &SecretRegistry) -> Result<Vec<u8>> {
+        let text = std::str::from_utf8(event)
+            .map_err(|_| CrebroError::Restore("SSE event is not UTF-8".into()))?;
+        let mut out = String::with_capacity(text.len());
+        for line in text.lines() {
+            if let Some(data) = line.strip_prefix("data:") {
+                let had_space = data.starts_with(' ');
+                let data = data.strip_prefix(' ').unwrap_or(data);
+                out.push_str("data:");
+                if had_space {
+                    out.push(' ');
+                }
+                out.push_str(&self.restore_sse_data(data, registry)?);
+                out.push('\n');
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        if out.ends_with('\n') {
+            out.pop();
+        }
+        Ok(out.into_bytes())
+    }
+
+    fn restore_sse_data(&mut self, data: &str, registry: &SecretRegistry) -> Result<String> {
+        if data == "[DONE]" || data.trim().is_empty() {
+            return Ok(data.to_string());
+        }
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) else {
+            return self.text_restorer.push_text(data, registry);
+        };
+        restore_text_fields_in_value(&mut value, &mut self.text_restorer, registry)?;
+        serde_json::to_string(&value).map_err(Into::into)
+    }
+}
+
+struct PlaceholderFragmentRestorer {
+    matcher: crate::restore::PlaceholderMatcher,
+    placeholders: Vec<Vec<u8>>,
+    pending: Vec<u8>,
+}
+
+impl PlaceholderFragmentRestorer {
+    fn new(registry: &SecretRegistry) -> Result<Self> {
+        Ok(Self {
+            matcher: crate::restore::PlaceholderMatcher::new(registry)?,
+            placeholders: registry
+                .placeholders()
+                .into_iter()
+                .map(|(placeholder, _)| placeholder.into_bytes())
+                .collect(),
+            pending: Vec::new(),
+        })
+    }
+
+    fn push_text(&mut self, text: &str, registry: &SecretRegistry) -> Result<String> {
+        if self.placeholders.is_empty() {
+            return Ok(text.to_string());
+        }
+
+        let mut combined = std::mem::take(&mut self.pending);
+        combined.extend_from_slice(text.as_bytes());
+        let hold_len = placeholder_prefix_suffix_len(&combined, &self.placeholders);
+        let safe_len = combined.len().saturating_sub(hold_len);
+        let restored = self.restore_complete_placeholders(&combined[..safe_len], registry)?;
+        self.pending.extend_from_slice(&combined[safe_len..]);
+        String::from_utf8(restored)
+            .map_err(|_| CrebroError::Restore("restored SSE text is not UTF-8".into()))
+    }
+
+    fn finish(mut self, registry: &SecretRegistry) -> Result<String> {
+        let pending = std::mem::take(&mut self.pending);
+        let restored = self.restore_complete_placeholders(&pending, registry)?;
+        String::from_utf8(restored)
+            .map_err(|_| CrebroError::Restore("restored SSE text is not UTF-8".into()))
+    }
+
+    fn restore_complete_placeholders(
+        &self,
+        bytes: &[u8],
+        registry: &SecretRegistry,
+    ) -> Result<Vec<u8>> {
+        let matches = self.matcher.find_in(bytes);
+        if matches.is_empty() {
+            return Ok(bytes.to_vec());
+        }
+
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut cursor = 0usize;
+        for mat in matches {
+            if mat.start < cursor {
+                continue;
+            }
+            out.extend_from_slice(&bytes[cursor..mat.start]);
+            registry.restore_to_vec(mat.secret_id, &mut out)?;
+            cursor = mat.end;
+        }
+        out.extend_from_slice(&bytes[cursor..]);
+        Ok(out)
+    }
+}
+
+fn restore_text_fields_in_value(
+    value: &mut serde_json::Value,
+    restorer: &mut PlaceholderFragmentRestorer,
+    registry: &SecretRegistry,
+) -> Result<()> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if is_stream_text_field(key) {
+                    restore_text_value(child, restorer, registry)?;
+                } else {
+                    restore_text_fields_in_value(child, restorer, registry)?;
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                restore_text_fields_in_value(item, restorer, registry)?;
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+    Ok(())
+}
+
+fn restore_text_value(
+    value: &mut serde_json::Value,
+    restorer: &mut PlaceholderFragmentRestorer,
+    registry: &SecretRegistry,
+) -> Result<()> {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = restorer.push_text(text, registry)?;
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                restore_text_value(item, restorer, registry)?;
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for child in map.values_mut() {
+                restore_text_value(child, restorer, registry)?;
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+    Ok(())
+}
+
+fn is_stream_text_field(key: &str) -> bool {
+    matches!(
+        key,
+        "content" | "delta" | "text" | "output_text" | "message"
+    )
+}
+
+fn placeholder_prefix_suffix_len(bytes: &[u8], placeholders: &[Vec<u8>]) -> usize {
+    let mut best = 0usize;
+    for placeholder in placeholders {
+        let max_len = bytes.len().min(placeholder.len().saturating_sub(1));
+        for len in (2..=max_len).rev() {
+            if bytes[bytes.len() - len..] == placeholder[..len] {
+                best = best.max(len);
+                break;
+            }
+        }
+    }
+    best
+}
+
+fn find_sse_event_end(bytes: &[u8]) -> Option<(usize, usize)> {
+    let lf = bytes.windows(2).position(|window| window == b"\n\n");
+    let crlf = bytes.windows(4).position(|window| window == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(lf), Some(crlf)) if crlf <= lf => Some((crlf, 4)),
+        (Some(lf), _) => Some((lf, 2)),
+        (None, Some(crlf)) => Some((crlf, 4)),
+        (None, None) => None,
+    }
+}
+
+async fn read_chunk_line<R>(reader: &mut R, pending: &mut Vec<u8>) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        if let Some(pos) = pending.windows(2).position(|window| window == b"\r\n") {
+            let line = pending[..pos].to_vec();
+            pending.drain(..pos + 2);
+            return Ok(line);
+        }
+        let mut buf = [0u8; 8192];
+        let n = reader
+            .read(&mut buf)
+            .await
+            .map_err(|err| CrebroError::Gateway(format!("failed to read HTTP chunk: {err}")))?;
+        if n == 0 {
+            return Err(CrebroError::Gateway(
+                "connection closed before chunked response completed".into(),
+            ));
+        }
+        pending.extend_from_slice(&buf[..n]);
+    }
+}
+
+async fn read_exact_pending<R>(reader: &mut R, pending: &mut Vec<u8>, len: usize) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    while pending.len() < len {
+        let mut buf = [0u8; 8192];
+        let n = reader.read(&mut buf).await.map_err(|err| {
+            CrebroError::Gateway(format!("failed to read HTTP chunk body: {err}"))
+        })?;
+        if n == 0 {
+            return Err(CrebroError::Gateway(
+                "connection closed before chunked response body completed".into(),
+            ));
+        }
+        pending.extend_from_slice(&buf[..n]);
+    }
+    Ok(pending.drain(..len).collect())
+}
+
+async fn read_chunk_trailers<R>(reader: &mut R, pending: &mut Vec<u8>) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        if read_chunk_line(reader, pending).await?.is_empty() {
+            return Ok(());
+        }
+    }
+}
+
+fn parse_chunk_len(line: &[u8]) -> Result<usize> {
+    let text = std::str::from_utf8(line)
+        .map_err(|_| CrebroError::Gateway("chunk size line is not UTF-8".into()))?;
+    let size = text.split(';').next().unwrap_or_default().trim();
+    usize::from_str_radix(size, 16)
+        .map_err(|err| CrebroError::Gateway(format!("invalid HTTP chunk size: {err}")))
+}
+
+async fn write_http_chunk<W>(writer: &mut W, bytes: &[u8]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    writer
+        .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
+        .await
+        .map_err(|err| CrebroError::Gateway(format!("failed to write HTTP chunk size: {err}")))?;
+    writer
+        .write_all(bytes)
+        .await
+        .map_err(|err| CrebroError::Gateway(format!("failed to write HTTP chunk body: {err}")))?;
+    writer
+        .write_all(b"\r\n")
+        .await
+        .map_err(|err| CrebroError::Gateway(format!("failed to finish HTTP chunk: {err}")))?;
+    Ok(())
 }
 
 async fn connect_upstream(
@@ -608,6 +1055,14 @@ fn content_length(head: &[u8]) -> Option<usize> {
     header_value(head, "content-length").and_then(|value| value.trim().parse().ok())
 }
 
+fn is_chunked_transfer(head: &[u8]) -> bool {
+    header_value(head, "transfer-encoding").is_some_and(|value| {
+        value
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
+    })
+}
+
 fn request_method_is(head: &[u8], expected: &str) -> bool {
     let Ok(head) = std::str::from_utf8(head) else {
         return false;
@@ -674,6 +1129,17 @@ fn is_text_http_body(head: &[u8]) -> bool {
     })
 }
 
+fn is_sse_http_body(head: &[u8]) -> bool {
+    content_type(head).is_some_and(|content_type| {
+        content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("text/event-stream")
+    })
+}
+
 fn content_type(head: &[u8]) -> Option<&str> {
     header_value(head, "content-type")
 }
@@ -736,6 +1202,39 @@ fn rewrite_http_head_for_body(
         out.push_str("content-length: ");
         out.push_str(&content_length.to_string());
         out.push_str("\r\n");
+    }
+    Ok(out.into_bytes())
+}
+
+fn rewrite_http_head_for_chunked(head: &[u8]) -> Result<Vec<u8>> {
+    let text = std::str::from_utf8(head)
+        .map_err(|_| CrebroError::Gateway("HTTP head is not UTF-8".into()))?;
+    let mut out = String::with_capacity(text.len().saturating_add(32));
+    let mut saw_transfer_encoding = false;
+    for (index, line) in text.split("\r\n").enumerate() {
+        if index == 0 {
+            out.push_str(line);
+            out.push_str("\r\n");
+            continue;
+        }
+        let Some((name, _value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("content-encoding")
+        {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            saw_transfer_encoding = true;
+            out.push_str("transfer-encoding: chunked\r\n");
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    if !saw_transfer_encoding {
+        out.push_str("transfer-encoding: chunked\r\n");
     }
     Ok(out.into_bytes())
 }

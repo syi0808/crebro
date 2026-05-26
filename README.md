@@ -174,6 +174,9 @@ The core scenario test suite covers:
 - message/object cache avoids storing subtrees with skipped binary/base64 fields
 - streaming placeholder restore across two- and three-chunk boundaries plus adjacent placeholders
 - gateway response restoration for placeholders split across upstream chunks
+- proxy chunked HTTP/SSE response restoration for placeholders split across HTTP chunks
+- proxy SSE delta restoration for placeholders split across separate stream events
+- proxy WebSocket JSON delta restoration for placeholders split across separate messages
 - stale `content-encoding` removal after response body restoration
 - gateway streams restored response chunks before the upstream response finishes
 - runtime registration of observed provider auth headers, including case-insensitive Bearer schemes and surrounding whitespace normalization
