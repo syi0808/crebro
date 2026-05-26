@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use crebro::{
     cli::{Cli, run_with_cli},
-    mode::{EffectiveMode, RuntimeMode},
+    mode::{EffectiveMode, resolve_effective_mode},
     patterns::CredentialPatternSet,
     process::{ProxyChildEnvConfig, proxy_sanitized_environment},
     proxy::{LocalCa, ProxyConfig, spawn_proxy},
@@ -17,21 +17,17 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 
 #[test]
-fn mode_selection_keeps_forced_modes_and_selects_codex_proxy_without_key() {
+fn mode_selection_uses_proxy_for_codex_without_provider_key() {
     assert_eq!(
-        RuntimeMode::Native.resolve(&["codex".to_string()], false),
+        resolve_effective_mode(&["/opt/homebrew/bin/codex".to_string()], false),
+        EffectiveMode::Proxy
+    );
+    assert_eq!(
+        resolve_effective_mode(&["codex".to_string()], true),
         EffectiveMode::Native
     );
     assert_eq!(
-        RuntimeMode::Proxy.resolve(&["claude".to_string()], true),
-        EffectiveMode::Proxy
-    );
-    assert_eq!(
-        RuntimeMode::Auto.resolve(&["/opt/homebrew/bin/codex".to_string()], false),
-        EffectiveMode::Proxy
-    );
-    assert_eq!(
-        RuntimeMode::Auto.resolve(&["codex".to_string()], true),
+        resolve_effective_mode(&["claude".to_string()], false),
         EffectiveMode::Native
     );
 }
@@ -150,6 +146,7 @@ async fn proxy_tunnels_allowlisted_connect_target() {
 
 #[tokio::test]
 async fn cli_proxy_mode_runs_child_with_proxy_environment_without_upstream_url() {
+    let codex = codex_shell_shim("proxy-child-env");
     let code = run_with_cli(Cli {
         listen_addr: "127.0.0.1:0".to_string(),
         upstream_url: None,
@@ -159,9 +156,8 @@ async fn cli_proxy_mode_runs_child_with_proxy_environment_without_upstream_url()
         stats_dir: None,
         tls_keylog_file: None,
         no_placeholder_guidance: false,
-        mode: RuntimeMode::Proxy,
         command: vec![
-            "/bin/sh".to_string(),
+            codex.to_string_lossy().to_string(),
             "-c".to_string(),
             r#"test -n "$HTTPS_PROXY" && test "$HTTPS_PROXY" = "$CREBRO_PROXY_URL""#.to_string(),
         ],
@@ -177,6 +173,7 @@ async fn cli_proxy_mode_accepts_upstream_tls_keylog_file_configuration() {
     let keylog_dir = unique_temp_dir("proxy-tls-keylog");
     std::fs::create_dir_all(&keylog_dir).unwrap();
     let keylog_path = keylog_dir.join("tls.keys");
+    let codex = codex_shell_shim("proxy-tls-keylog-child");
     let code = run_with_cli(Cli {
         listen_addr: "127.0.0.1:0".to_string(),
         upstream_url: None,
@@ -186,8 +183,11 @@ async fn cli_proxy_mode_accepts_upstream_tls_keylog_file_configuration() {
         stats_dir: None,
         tls_keylog_file: Some(keylog_path.clone()),
         no_placeholder_guidance: false,
-        mode: RuntimeMode::Proxy,
-        command: vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
+        command: vec![
+            codex.to_string_lossy().to_string(),
+            "-c".to_string(),
+            "true".to_string(),
+        ],
     })
     .await
     .unwrap();
@@ -1041,4 +1041,17 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
             .unwrap()
             .as_nanos()
     ))
+}
+
+fn codex_shell_shim(prefix: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = unique_temp_dir(prefix);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("codex");
+    std::fs::write(&path, b"#!/bin/sh\nexec /bin/sh \"$@\"\n").unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    path
 }

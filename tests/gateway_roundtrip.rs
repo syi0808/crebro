@@ -18,7 +18,6 @@ use axum::{
 use crebro::{
     cli::{Cli, infer_default_upstream_url, run_with_cli},
     gateway::{GatewayConfig, spawn_gateway},
-    mode::RuntimeMode,
     process::sanitized_environment,
     secrets::{SecretId, SecretLabel, SecretRegistry, SecureBuf},
 };
@@ -967,7 +966,6 @@ async fn cli_one_shot_wrapper_returns_child_exit_status() {
         stats_dir: Some(unique_temp_dir("cli-exit-stats")),
         tls_keylog_file: None,
         no_placeholder_guidance: false,
-        mode: RuntimeMode::Native,
         command: vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -1019,7 +1017,6 @@ if secret not in body or "{{CREBRO_SECRET" in body:
         stats_dir: Some(unique_temp_dir("cli-wrapper-stats")),
         tls_keylog_file: None,
         no_placeholder_guidance: false,
-        mode: RuntimeMode::Native,
         command: vec!["python3".to_string(), "-c".to_string(), script],
     })
     .await

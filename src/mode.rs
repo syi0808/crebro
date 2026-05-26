@@ -1,33 +1,16 @@
 use std::path::Path;
 
-use clap::ValueEnum;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum RuntimeMode {
-    Auto,
-    Native,
-    Proxy,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffectiveMode {
     Native,
     Proxy,
 }
 
-impl RuntimeMode {
-    pub fn resolve(self, command: &[String], has_provider_key: bool) -> EffectiveMode {
-        match self {
-            RuntimeMode::Native => EffectiveMode::Native,
-            RuntimeMode::Proxy => EffectiveMode::Proxy,
-            RuntimeMode::Auto => {
-                if is_codex_command(command) && !has_provider_key {
-                    EffectiveMode::Proxy
-                } else {
-                    EffectiveMode::Native
-                }
-            }
-        }
+pub fn resolve_effective_mode(command: &[String], has_provider_key: bool) -> EffectiveMode {
+    if is_codex_command(command) && !has_provider_key {
+        EffectiveMode::Proxy
+    } else {
+        EffectiveMode::Native
     }
 }
 
@@ -45,24 +28,12 @@ pub fn is_codex_command(command: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{EffectiveMode, RuntimeMode};
-
-    #[test]
-    fn forced_modes_resolve_directly() {
-        assert_eq!(
-            RuntimeMode::Native.resolve(&["codex".to_string()], false),
-            EffectiveMode::Native
-        );
-        assert_eq!(
-            RuntimeMode::Proxy.resolve(&["claude".to_string()], true),
-            EffectiveMode::Proxy
-        );
-    }
+    use super::{EffectiveMode, resolve_effective_mode};
 
     #[test]
     fn auto_selects_proxy_for_codex_without_provider_key() {
         assert_eq!(
-            RuntimeMode::Auto.resolve(&["/opt/bin/codex".to_string()], false),
+            resolve_effective_mode(&["/opt/bin/codex".to_string()], false),
             EffectiveMode::Proxy
         );
     }
@@ -70,7 +41,7 @@ mod tests {
     #[test]
     fn auto_keeps_native_for_codex_with_provider_key() {
         assert_eq!(
-            RuntimeMode::Auto.resolve(&["codex".to_string()], true),
+            resolve_effective_mode(&["codex".to_string()], true),
             EffectiveMode::Native
         );
     }
@@ -78,7 +49,7 @@ mod tests {
     #[test]
     fn auto_keeps_native_for_other_commands() {
         assert_eq!(
-            RuntimeMode::Auto.resolve(&["claude".to_string()], false),
+            resolve_effective_mode(&["claude".to_string()], false),
             EffectiveMode::Native
         );
     }

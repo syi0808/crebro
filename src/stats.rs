@@ -120,7 +120,6 @@ fn update_stats_file(path: &Path, update: impl FnOnce(&mut StatsFile)) -> std::i
 
     let mut stats = read_stats_file(path).unwrap_or_default();
     stats.version = 1;
-    stats.updated_at_unix = now_unix();
     update(&mut stats);
     stats.updated_at_unix = now_unix();
 

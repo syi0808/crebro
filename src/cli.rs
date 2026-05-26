@@ -8,7 +8,7 @@ use crate::{
     Result,
     gateway::{GatewayConfig, spawn_gateway},
     hardening,
-    mode::{EffectiveMode, RuntimeMode},
+    mode::{EffectiveMode, resolve_effective_mode},
     patterns::CredentialPatternSet,
     process::{
         ProxyChildEnvConfig, first_provider_key_from_env, provider_key_env_present,
@@ -49,9 +49,6 @@ pub struct Cli {
     #[arg(long, env = "CREBRO_NO_PLACEHOLDER_GUIDANCE")]
     pub no_placeholder_guidance: bool,
 
-    #[arg(long, env = "CREBRO_MODE", value_enum, default_value_t = RuntimeMode::Auto)]
-    pub mode: RuntimeMode,
-
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
 }
@@ -86,7 +83,7 @@ pub async fn run_with_cli(mut cli: Cli) -> Result<i32> {
         .as_ref()
         .is_some_and(|key| !key.is_empty())
         || provider_key_env_present();
-    let effective_mode = cli.mode.resolve(&cli.command, has_provider_key);
+    let effective_mode = resolve_effective_mode(&cli.command, has_provider_key);
 
     let provider_auth_secret = if let Some(mut key) = cli.provider_api_key.take() {
         let id = registry.ingest(
