@@ -116,6 +116,14 @@ fn secret_candidate_filtering_accepts_keys_and_rejects_common_values() {
         "GOOGLE_APPLICATION_CREDENTIALS_JSON",
         br#"{"private_key":"-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----"}"#
     ));
+    assert!(is_secret_candidate(
+        "CLOUDFLARE_API_TOKEN",
+        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN"
+    ));
+    assert!(is_secret_candidate(
+        "CF_API_KEY",
+        b"0123456789abcdef0123456789abcdef01234"
+    ));
     assert!(!is_secret_candidate("NODE_ENV", b"development"));
     assert!(!is_secret_candidate("PORT", b"3000"));
     assert!(!is_secret_candidate("DEBUG", b"true"));

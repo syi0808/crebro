@@ -361,7 +361,7 @@ fn user_secret_directive_satisfies_credential_pattern_detector() {
 }
 
 #[test]
-fn built_in_credential_patterns_cover_common_provider_prefixes() {
+fn built_in_credential_patterns_auto_redact_common_provider_prefixes() {
     let pypi_token = format!("pypi-{}", "A".repeat(85));
     let sendgrid_token = format!("SG.{}.{}", "A".repeat(22), "B".repeat(43));
     let cases = [
@@ -408,6 +408,10 @@ fn built_in_credential_patterns_cover_common_provider_prefixes() {
             "sb_secret_abcdefghijklmnopqrstuvwxyz1234567890".to_string(),
         ),
         (
+            "cloudflare_api_credential_assignment",
+            "CLOUDFLARE_API_TOKEN=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN".to_string(),
+        ),
+        (
             "private_key_block",
             format!(
                 "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----",
@@ -427,17 +431,58 @@ fn built_in_credential_patterns_cover_common_provider_prefixes() {
             "messages": [{"role": "user", "content": format!("send {credential}")}]
         });
 
-        let err = sanitizer
+        let (out, report) = sanitizer
             .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
-            .unwrap_err();
-        let err_text = err.to_string();
+            .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let expected_label = format!("AUTO_{}", pattern_id.to_ascii_uppercase());
 
+        assert!(!out.contains(credential.as_str()));
         assert!(
-            err_text.contains(pattern_id),
-            "expected {pattern_id}, got {err_text}"
+            out.contains(&expected_label),
+            "expected {expected_label}, got {out}"
         );
-        assert!(!err_text.contains(credential.as_str()));
+        assert!(!report.redacted_secret_ids.is_empty());
+        assert!(report.unregistered_pattern_ids.is_empty());
     }
+}
+
+#[test]
+fn built_in_suspicious_context_patterns_require_explicit_secret() {
+    let mut registry = SecretRegistry::with_generated_keys();
+    let mut sanitizer = JsonSanitizer::new(64);
+    let credential = "cloudflare api token abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN";
+    let payload = json!({
+        "messages": [{"role": "user", "content": format!("send {credential}")}]
+    });
+
+    let err = sanitizer
+        .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
+        .unwrap_err();
+    let err_text = err.to_string();
+
+    assert!(err_text.contains("cloudflare_api_credential_context"));
+    assert!(!err_text.contains(credential));
+}
+
+#[test]
+fn built_in_auto_redacts_cloudflare_user_token() {
+    let cloudflare_token = "cfut_9hfLomXE30g151Zm1HoX6OmDm5pao1C1zsNhlQeA5cfcd85f";
+    let mut registry = SecretRegistry::with_generated_keys();
+    let mut sanitizer = JsonSanitizer::new(64);
+    let payload = json!({
+        "messages": [{"role": "user", "content": format!("send {cloudflare_token}")}]
+    });
+
+    let (out, report) = sanitizer
+        .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
+        .unwrap();
+    let out = String::from_utf8(out).unwrap();
+
+    assert!(!out.contains(cloudflare_token));
+    assert!(out.contains("{{CREBRO_SECRET:v1:AUTO_CLOUDFLARE_USER_TOKEN:"));
+    assert_eq!(report.redacted_secret_ids.len(), 1);
+    assert!(report.unregistered_pattern_ids.is_empty());
 }
 
 #[test]

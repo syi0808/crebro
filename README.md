@@ -9,8 +9,8 @@ Core principles:
 - in-memory only
 - no persistent secret storage
 - no daemon
-- no MITM
-- native LLM gateway only
+- native LLM gateway by default
+- local child-scoped proxy mode for agent auth paths that cannot use native gateway routing
 - plaintext-minimized secret handling
 - large-context optimized redaction
 
@@ -22,9 +22,28 @@ crebro -- codex
 
 Crebro starts a loopback gateway, launches the child command, points common provider base URL variables at the gateway, removes raw provider keys from the child environment, and exits with the child status. It infers default upstream URLs for `codex`, `claude`, `gemini`, and `opencode`; pass `--upstream-url` or set `CREBRO_UPSTREAM_URL` to override that default.
 
+Mode selection can be forced with:
+
+```sh
+crebro --mode native -- codex
+crebro --mode proxy -- codex
+```
+
+`native` is the existing provider API gateway path. `proxy` starts a local
+explicit proxy and injects proxy environment variables into the child process.
+Proxy mode supports Codex ChatGPT auth traffic, where Codex calls
+`chatgpt.com/backend-api` directly instead of honoring `OPENAI_BASE_URL`.
+
+Current proxy-mode implementation handles allowlisted `CONNECT` traffic with a
+session local CA, downstream TLS termination, WebSocket handshake forwarding,
+WebSocket text-frame redaction/restore, and content-length-delimited HTTP
+JSON/text body redaction/restore. It does not hide Codex ChatGPT session
+credentials from Codex or from `chatgpt.com`, and it does not install
+system-wide trust.
+
 Verified local routing surfaces:
 
-- Codex CLI 0.132.0: OpenAI-compatible routing through `OPENAI_BASE_URL`.
+- Codex CLI 0.133.0: OpenAI-compatible routing through `OPENAI_BASE_URL`; ChatGPT auth proxy mode through child-scoped proxy env and `chatgpt.com/backend-api`.
 - Claude Code 2.1.112: Anthropic-compatible routing through `ANTHROPIC_BASE_URL` and `CLAUDE_CODE_API_BASE_URL`.
 - Gemini CLI 0.42.0: Gemini API-key routing through `GOOGLE_GEMINI_BASE_URL`.
 - OpenCode 1.15.4: OpenAI/Anthropic provider routing through `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`.
@@ -157,6 +176,9 @@ Expected network shape:
 
 - `codex`, `claude`, `gemini`, or `opencode` may connect to `127.0.0.1` or `localhost`.
 - The wrapped agent should not connect directly to `api.openai.com`, `api.anthropic.com`, or `generativelanguage.googleapis.com`.
+- In Codex ChatGPT auth proxy mode, the wrapped `codex` process should not
+  connect directly to `chatgpt.com`; Crebro should be the process connecting
+  to `chatgpt.com`.
 - `crebro` is the process that may connect to the upstream provider endpoint.
 
 This proves process-level mediation, not HTTPS payload contents. To inspect

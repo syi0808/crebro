@@ -151,6 +151,7 @@ fn increment_pattern(stats: &mut StatsFile, pattern_id: &str, action: OnUnregist
 fn action_name(action: OnUnregisteredMatch) -> &'static str {
     match action {
         OnUnregisteredMatch::RequireExplicitSecret => "require_explicit_secret",
+        OnUnregisteredMatch::AutoRedact => "auto_redact",
         OnUnregisteredMatch::Allow => "allow",
     }
 }

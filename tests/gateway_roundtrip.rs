@@ -18,6 +18,7 @@ use axum::{
 use crebro::{
     cli::{Cli, infer_default_upstream_url, run_with_cli},
     gateway::{GatewayConfig, spawn_gateway},
+    mode::RuntimeMode,
     process::sanitized_environment,
     secrets::{SecretId, SecretLabel, SecretRegistry, SecureBuf},
 };
@@ -480,7 +481,7 @@ async fn gateway_records_unregistered_pattern_stats_on_reject() {
     .await
     .unwrap();
 
-    let secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+    let secret = "cloudflare api token abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN";
     let body = format!(r#"{{"messages":[{{"role":"user","content":"send {secret}"}}]}}"#);
     let response = reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", gateway.url()))
@@ -494,7 +495,7 @@ async fn gateway_records_unregistered_pattern_stats_on_reject() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(bodies.lock().await.is_empty());
     let stats = std::fs::read_to_string(&stats_path).unwrap();
-    assert!(stats.contains("github_token"));
+    assert!(stats.contains("cloudflare_api_credential_context"));
     assert!(stats.contains("require_explicit_secret"));
     assert!(stats.contains("\"count\": 1"));
     assert!(!stats.contains(secret));
@@ -965,6 +966,7 @@ async fn cli_one_shot_wrapper_returns_child_exit_status() {
         patterns_file: None,
         stats_dir: Some(unique_temp_dir("cli-exit-stats")),
         tls_keylog_file: None,
+        mode: RuntimeMode::Native,
         command: vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -1015,6 +1017,7 @@ if secret not in body or "{{CREBRO_SECRET" in body:
         patterns_file: None,
         stats_dir: Some(unique_temp_dir("cli-wrapper-stats")),
         tls_keylog_file: None,
+        mode: RuntimeMode::Native,
         command: vec!["python3".to_string(), "-c".to_string(), script],
     })
     .await

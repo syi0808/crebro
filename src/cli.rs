@@ -8,8 +8,13 @@ use crate::{
     Result,
     gateway::{GatewayConfig, spawn_gateway},
     hardening,
+    mode::{EffectiveMode, RuntimeMode},
     patterns::CredentialPatternSet,
-    process::{first_provider_key_from_env, run_child},
+    process::{
+        ProxyChildEnvConfig, first_provider_key_from_env, provider_key_env_present,
+        proxy_sanitized_environment, run_child, run_child_with_env,
+    },
+    proxy::{ProxyConfig, spawn_proxy},
     secrets::{
         SecretLabel, SecretRegistry, SecureBuf, discover_dotenv_candidates_with_patterns,
         discover_env_candidates_with_patterns,
@@ -41,6 +46,9 @@ pub struct Cli {
     #[arg(long, env = "CREBRO_TLS_KEYLOG_FILE")]
     pub tls_keylog_file: Option<std::path::PathBuf>,
 
+    #[arg(long, env = "CREBRO_MODE", value_enum, default_value_t = RuntimeMode::Auto)]
+    pub mode: RuntimeMode,
+
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
 }
@@ -70,6 +78,13 @@ pub async fn run_with_cli(mut cli: Cli) -> Result<i32> {
         registry.ingest(candidate.label, candidate.value)?;
     }
 
+    let has_provider_key = cli
+        .provider_api_key
+        .as_ref()
+        .is_some_and(|key| !key.is_empty())
+        || provider_key_env_present();
+    let effective_mode = cli.mode.resolve(&cli.command, has_provider_key);
+
     let provider_auth_secret = if let Some(mut key) = cli.provider_api_key.take() {
         let id = registry.ingest(
             SecretLabel::new("CREBRO_PROVIDER_API_KEY"),
@@ -82,6 +97,34 @@ pub async fn run_with_cli(mut cli: Cli) -> Result<i32> {
     } else {
         None
     };
+
+    if effective_mode == EffectiveMode::Proxy {
+        tracing::warn!(
+            "Crebro proxy mode selected for child process; local MITM is enabled for allowlisted targets and ChatGPT auth tokens remain visible to the child and upstream"
+        );
+        let proxy = spawn_proxy(ProxyConfig {
+            listen_addr: cli.listen_addr,
+            registry: Arc::new(RwLock::new(registry)),
+            patterns: Arc::clone(&patterns),
+            tls_keylog_file: cli.tls_keylog_file,
+            ..ProxyConfig::default()
+        })
+        .await?;
+        let ca_bundle_path = proxy.ca_bundle_path().map(|path| path.to_path_buf());
+        let child_env = proxy_sanitized_environment(
+            std::env::vars(),
+            &ProxyChildEnvConfig {
+                proxy_url: proxy.url(),
+                ca_bundle_path,
+            },
+        );
+        let status = run_child_with_env(&cli.command, child_env).await?;
+        return if status.success() {
+            Ok(0)
+        } else {
+            Ok(status.code().unwrap_or(1))
+        };
+    }
 
     let upstream_url = cli
         .upstream_url

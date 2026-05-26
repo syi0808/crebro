@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::{
     CrebroError, Result,
     patterns::{CredentialPatternSet, OnUnregisteredMatch},
-    secrets::{SecretId, SecretRegistry},
+    secrets::{SecretId, SecretLabel, SecretRegistry, SecureBuf},
 };
 
 use super::{
@@ -211,6 +211,29 @@ impl JsonSanitizer {
         ))
     }
 
+    pub fn sanitize_text_payload(
+        &mut self,
+        text: &str,
+        registry: &mut SecretRegistry,
+    ) -> Result<(String, SanitizerReport)> {
+        let mut report = SanitizerReport {
+            input_bytes: text.len(),
+            output_bytes: 0,
+            cache_stats: self.cache.stats(),
+            redacted_secret_ids: Vec::new(),
+            unregistered_pattern_ids: Vec::new(),
+        };
+        let sanitized = self.sanitize_decoded_string(
+            text,
+            registry,
+            &mut report.redacted_secret_ids,
+            &mut report.unregistered_pattern_ids,
+        )?;
+        report.output_bytes = sanitized.len();
+        report.cache_stats = self.cache.stats();
+        Ok((sanitized, report))
+    }
+
     fn sanitize_raw_json_string(
         &mut self,
         raw_string: &[u8],
@@ -292,11 +315,24 @@ impl JsonSanitizer {
             })?
         {
             redacted_secret_ids.extend(sanitized.secret_ids.iter().copied());
-            let pattern_ids = self.inspect_unregistered_patterns(&sanitized.text)?;
+            let auto_redacted = self.auto_register_pattern_matches(&sanitized.text, registry)?;
+            let sanitized_text = if auto_redacted {
+                let sanitized_again = self
+                    .cache
+                    .sanitize_string_detailed(sanitized.text.as_bytes(), registry)?;
+                redacted_secret_ids.extend(sanitized_again.redacted_secret_ids.iter().copied());
+                String::from_utf8(sanitized_again.bytes).map_err(|_| {
+                    CrebroError::Redaction("sanitized JSON string is not valid UTF-8".into())
+                })?
+            } else {
+                sanitized.text
+            };
+            let pattern_ids = self.inspect_unregistered_patterns(&sanitized_text)?;
             unregistered_pattern_ids.extend(pattern_ids);
-            return Ok(sanitized.text);
+            return Ok(sanitized_text);
         }
 
+        self.auto_register_pattern_matches(decoded, registry)?;
         if registry.is_empty() {
             let pattern_ids = self.inspect_unregistered_patterns(decoded)?;
             unregistered_pattern_ids.extend(pattern_ids);
@@ -313,6 +349,14 @@ impl JsonSanitizer {
         let pattern_ids = self.inspect_unregistered_patterns(&text)?;
         unregistered_pattern_ids.extend(pattern_ids);
         Ok(text)
+    }
+
+    fn auto_register_pattern_matches(
+        &self,
+        text: &str,
+        registry: &mut SecretRegistry,
+    ) -> Result<bool> {
+        auto_register_pattern_matches(&self.patterns, text, registry)
     }
 
     fn sanitize_value(
@@ -412,6 +456,7 @@ impl JsonSanitizer {
                         pattern_id: pattern_match.id,
                     });
                 }
+                OnUnregisteredMatch::AutoRedact => {}
                 OnUnregisteredMatch::Allow => allowed.push(pattern_match.id),
             }
         }
@@ -494,10 +539,24 @@ fn sanitize_decoded_string_with_cache(
         })?
     {
         report.redacted_secret_ids.extend(sanitized.secret_ids);
-        inspect_patterns(patterns, &sanitized.text, report)?;
-        return Ok(sanitized.text);
+        let auto_redacted = auto_register_pattern_matches(patterns, &sanitized.text, registry)?;
+        let sanitized_text = if auto_redacted {
+            let sanitized_again =
+                cache.sanitize_string_detailed(sanitized.text.as_bytes(), registry)?;
+            report
+                .redacted_secret_ids
+                .extend(sanitized_again.redacted_secret_ids.iter().copied());
+            String::from_utf8(sanitized_again.bytes).map_err(|_| {
+                CrebroError::Redaction("sanitized JSON string is not valid UTF-8".into())
+            })?
+        } else {
+            sanitized.text
+        };
+        inspect_patterns(patterns, &sanitized_text, report)?;
+        return Ok(sanitized_text);
     }
 
+    auto_register_pattern_matches(patterns, decoded, registry)?;
     if registry.is_empty() {
         inspect_patterns(patterns, decoded, report)?;
         return Ok(decoded.to_string());
@@ -577,10 +636,31 @@ fn inspect_patterns(
                     pattern_id: pattern_match.id,
                 });
             }
+            OnUnregisteredMatch::AutoRedact => {}
             OnUnregisteredMatch::Allow => report.unregistered_pattern_ids.push(pattern_match.id),
         }
     }
     Ok(())
+}
+
+fn auto_register_pattern_matches(
+    patterns: &CredentialPatternSet,
+    text: &str,
+    registry: &mut SecretRegistry,
+) -> Result<bool> {
+    let matches = patterns.auto_redact_matches(text);
+    let mut registered = false;
+    for matched in matches {
+        let Some(secret) = text.get(matched.start..matched.end) else {
+            continue;
+        };
+        registry.ingest(
+            SecretLabel::new(format!("AUTO_{}", matched.pattern_id.to_ascii_uppercase())),
+            SecureBuf::from_slice(secret.as_bytes()),
+        )?;
+        registered = true;
+    }
+    Ok(registered)
 }
 
 fn is_cacheable_object_path(path: &[String]) -> bool {

@@ -23,12 +23,16 @@ pub fn build_upstream_client(tls_keylog_file: Option<&Path>) -> Result<reqwest::
     .with_root_certificates(roots)
     .with_no_client_auth();
     tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    tls.key_log = Arc::new(FileKeyLog::open(path)?);
+    tls.key_log = open_file_key_log(path)?;
 
     reqwest::Client::builder()
         .use_preconfigured_tls(tls)
         .build()
         .map_err(Into::into)
+}
+
+pub(crate) fn open_file_key_log(path: &Path) -> Result<Arc<dyn rustls::KeyLog>> {
+    Ok(Arc::new(FileKeyLog::open(path)?))
 }
 
 #[derive(Debug)]

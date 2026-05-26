@@ -40,6 +40,7 @@ pub struct CompiledCredentialPattern {
 #[serde(rename_all = "snake_case")]
 pub enum OnUnregisteredMatch {
     RequireExplicitSecret,
+    AutoRedact,
     Allow,
 }
 
@@ -47,6 +48,13 @@ pub enum OnUnregisteredMatch {
 pub struct CredentialPatternMatch {
     pub id: String,
     pub on_unregistered_match: OnUnregisteredMatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialAutoRedactMatch {
+    pub pattern_id: String,
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +112,9 @@ impl CredentialPatternSet {
         let mut matches = Vec::new();
         let mut seen = HashSet::new();
         for pattern in &self.credential_patterns {
+            if pattern.on_unregistered_match == OnUnregisteredMatch::AutoRedact {
+                continue;
+            }
             if pattern.regex.is_match(text) && seen.insert(pattern.id.clone()) {
                 matches.push(CredentialPatternMatch {
                     id: pattern.id.clone(),
@@ -114,9 +125,50 @@ impl CredentialPatternSet {
         matches
     }
 
+    pub fn auto_redact_matches(&self, text: &str) -> Vec<CredentialAutoRedactMatch> {
+        let mut matches = Vec::new();
+        for pattern in &self.credential_patterns {
+            if pattern.on_unregistered_match != OnUnregisteredMatch::AutoRedact {
+                continue;
+            }
+            for matched in pattern.regex.find_iter(text) {
+                matches.push(CredentialAutoRedactMatch {
+                    pattern_id: pattern.id.clone(),
+                    start: matched.start(),
+                    end: matched.end(),
+                });
+            }
+        }
+        select_longest_non_overlapping_matches(matches)
+    }
+
     pub fn has_credential_patterns(&self) -> bool {
         !self.credential_patterns.is_empty()
     }
+}
+
+fn select_longest_non_overlapping_matches(
+    mut matches: Vec<CredentialAutoRedactMatch>,
+) -> Vec<CredentialAutoRedactMatch> {
+    matches.sort_by(|left, right| {
+        let left_len = left.end.saturating_sub(left.start);
+        let right_len = right.end.saturating_sub(right.start);
+        right_len
+            .cmp(&left_len)
+            .then_with(|| left.start.cmp(&right.start))
+            .then_with(|| left.end.cmp(&right.end))
+    });
+    let mut selected: Vec<CredentialAutoRedactMatch> = Vec::new();
+    'candidate: for candidate in matches {
+        for existing in &selected {
+            if candidate.start < existing.end && existing.start < candidate.end {
+                continue 'candidate;
+            }
+        }
+        selected.push(candidate);
+    }
+    selected.sort_by_key(|matched| matched.start);
+    selected
 }
 
 impl RawPatternFile {
