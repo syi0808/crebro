@@ -781,7 +781,7 @@ fn restore_text_fields_in_value(
         serde_json::Value::Object(map) => {
             for (key, child) in map {
                 if is_stream_text_field(key) {
-                    restore_text_value(child, restorer, registry)?;
+                    restore_stream_field_value(child, restorer, registry)?;
                 } else {
                     restore_text_fields_in_value(child, restorer, registry)?;
                 }
@@ -800,7 +800,7 @@ fn restore_text_fields_in_value(
     Ok(())
 }
 
-fn restore_text_value(
+fn restore_stream_field_value(
     value: &mut serde_json::Value,
     restorer: &mut PlaceholderFragmentRestorer,
     registry: &SecretRegistry,
@@ -811,13 +811,21 @@ fn restore_text_value(
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                restore_text_value(item, restorer, registry)?;
+                match item {
+                    serde_json::Value::String(text) => {
+                        *text = restorer.push_text(text, registry)?;
+                    }
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        restore_text_fields_in_value(item, restorer, registry)?;
+                    }
+                    serde_json::Value::Null
+                    | serde_json::Value::Bool(_)
+                    | serde_json::Value::Number(_) => {}
+                }
             }
         }
-        serde_json::Value::Object(map) => {
-            for child in map.values_mut() {
-                restore_text_value(child, restorer, registry)?;
-            }
+        serde_json::Value::Object(_) => {
+            restore_text_fields_in_value(value, restorer, registry)?;
         }
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
@@ -827,7 +835,7 @@ fn restore_text_value(
 fn is_stream_text_field(key: &str) -> bool {
     matches!(
         key,
-        "content" | "delta" | "text" | "output_text" | "message"
+        "content" | "delta" | "text" | "output_text" | "message" | "partial_json" | "thinking"
     )
 }
 

@@ -249,6 +249,12 @@ fn registry_with_secret() -> (SecretRegistry, SecretId, String) {
     (registry, id, placeholder)
 }
 
+fn split_inside(text: &str, needle: &str) -> Vec<Vec<u8>> {
+    let split = text.find(needle).unwrap() + needle.len() / 2;
+    let bytes = text.as_bytes();
+    vec![bytes[..split].to_vec(), bytes[split..].to_vec()]
+}
+
 #[test]
 fn child_env_does_not_receive_provider_key() {
     let env = sanitized_environment(
@@ -745,6 +751,61 @@ async fn gateway_restores_placeholder_split_across_upstream_chunks() {
 }
 
 #[tokio::test]
+async fn provider_response_fixtures_restore_supported_payload_shapes() {
+    let cases = [
+        (
+            "/v1beta/models/gemini-1.5-pro:generateContent",
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Gemini says {placeholder}"}]}}]}"#,
+        ),
+        (
+            "/v1/messages",
+            r#"{"content":[{"type":"text","text":"Claude says {placeholder}"}]}"#,
+        ),
+        (
+            "/v1/chat/completions",
+            r#"{"choices":[{"message":{"role":"assistant","content":"OpenCode OpenAI-compatible says {placeholder}"}}]}"#,
+        ),
+        (
+            "/v1/responses",
+            r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"Responses API says {placeholder}"}]}]}"#,
+        ),
+    ];
+
+    for (path, response_template) in cases {
+        let (registry, _, placeholder) = registry_with_secret();
+        let response_text = response_template.replace("{placeholder}", &placeholder);
+        let upstream_url = spawn_chunked_upstream(split_inside(&response_text, &placeholder)).await;
+        let gateway = spawn_gateway(
+            GatewayConfig {
+                listen_addr: "127.0.0.1:0".to_string(),
+                upstream_base: upstream_url,
+                provider_auth_secret: None,
+                cache_entries: 64,
+                streaming_json_threshold_bytes: 256 * 1024,
+                ..GatewayConfig::default()
+            },
+            Arc::new(RwLock::new(registry)),
+        )
+        .await
+        .unwrap();
+
+        let body = reqwest::Client::new()
+            .post(format!("{}{}", gateway.url(), path))
+            .header("content-type", "application/json")
+            .body(r#"{"messages":[]}"#)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        assert!(body.contains("sk-gateway-secret-1234567890"));
+        assert!(!body.contains("{{CREBRO_SECRET"));
+    }
+}
+
+#[tokio::test]
 async fn gateway_strips_content_encoding_after_response_restore() {
     let (registry, _, placeholder) = registry_with_secret();
     let mut response_headers = HeaderMap::new();
@@ -1085,10 +1146,26 @@ async fn provider_schema_fixtures_redact_supported_payloads() {
             }),
         ),
         (
+            "/v1/responses",
+            serde_json::json!({
+                "input": [{
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "fixture-secret-1234567890"}]
+                }],
+                "tools": [{"type": "function", "name": "shell", "description": "fixture-secret-1234567890"}]
+            }),
+        ),
+        (
             "/v1/messages",
             serde_json::json!({
                 "system": "fixture-secret-1234567890",
-                "messages": [{"role": "user", "content": "fixture-secret-1234567890"}],
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "fixture-secret-1234567890"},
+                        {"type": "tool_result", "tool_use_id": "toolu_01", "content": "fixture-secret-1234567890"}
+                    ]
+                }],
                 "tools": [{"name": "tool", "description": "fixture-secret-1234567890"}]
             }),
         ),
@@ -1098,6 +1175,7 @@ async fn provider_schema_fixtures_redact_supported_payloads() {
                 "contents": [{
                     "parts": [
                         {"text": "fixture-secret-1234567890"},
+                        {"function_response": {"name": "lookup", "response": {"result": "fixture-secret-1234567890"}}},
                         {"inline_data": {"mime_type": "image/png", "data": "fixture-secret-1234567890"}}
                     ]
                 }],
@@ -1119,15 +1197,15 @@ async fn provider_schema_fixtures_redact_supported_payloads() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
     let bodies = bodies.lock().await;
-    assert_eq!(bodies.len(), 3);
+    assert_eq!(bodies.len(), 4);
     for body in bodies.iter() {
         let body_text = String::from_utf8_lossy(body);
         assert!(body_text.contains("{{CREBRO_SECRET:v1:FIXTURE_TOKEN:"));
     }
 
-    let gemini_body: serde_json::Value = serde_json::from_slice(&bodies[2]).unwrap();
+    let gemini_body: serde_json::Value = serde_json::from_slice(&bodies[3]).unwrap();
     assert_eq!(
-        gemini_body["contents"][0]["parts"][1]["inline_data"]["data"],
+        gemini_body["contents"][0]["parts"][2]["inline_data"]["data"],
         "fixture-secret-1234567890"
     );
 }

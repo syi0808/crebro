@@ -376,6 +376,28 @@ async fn proxy_mitm_websocket_restores_placeholder_split_across_json_delta_messa
         write_ws_frame(&mut stream, second.as_bytes(), false)
             .await
             .unwrap();
+        let provider_first = serde_json::json!({
+            "type": "content_block_delta",
+            "delta": {
+                "type": "text_delta",
+                "text": format!("Claude {}", &placeholder[..split])
+            }
+        })
+        .to_string();
+        let provider_second = serde_json::json!({
+            "type": "content_block_delta",
+            "delta": {
+                "type": "text_delta",
+                "text": format!("{} done", &placeholder[split..])
+            }
+        })
+        .to_string();
+        write_ws_frame(&mut stream, provider_first.as_bytes(), false)
+            .await
+            .unwrap();
+        write_ws_frame(&mut stream, provider_second.as_bytes(), false)
+            .await
+            .unwrap();
     });
 
     let proxy = spawn_proxy(ProxyConfig {
@@ -416,8 +438,11 @@ async fn proxy_mitm_websocket_restores_placeholder_split_across_json_delta_messa
     .unwrap();
     let first = String::from_utf8(read_ws_frame(&mut tls, false).await).unwrap();
     let second = String::from_utf8(read_ws_frame(&mut tls, false).await).unwrap();
-    let combined = format!("{first}{second}");
+    let third = String::from_utf8(read_ws_frame(&mut tls, false).await).unwrap();
+    let fourth = String::from_utf8(read_ws_frame(&mut tls, false).await).unwrap();
+    let combined = format!("{first}{second}{third}{fourth}");
     assert!(combined.contains(secret));
+    assert!(combined.contains("text_delta"));
     assert!(!combined.contains("{{CREBRO_SECRET"));
 
     upstream.await.unwrap();
@@ -788,6 +813,144 @@ async fn proxy_mitm_sse_response_restores_placeholder_split_across_delta_events(
 }
 
 #[tokio::test]
+async fn proxy_mitm_provider_sse_shapes_restore_placeholder_fragments() {
+    let claude_body = run_proxy_sse_case(
+        "claude-sse-secret-1234567890",
+        "CLAUDE_SSE_SECRET",
+        "/v1/messages",
+        |placeholder| {
+            let split = placeholder.len() / 2;
+            vec![
+                "event: ping\ndata: keepalive\n\n".to_string(),
+                format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "delta": {
+                            "type": "text_delta",
+                            "text": format!("Claude {}", &placeholder[..split])
+                        }
+                    })
+                ),
+                format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "delta": {
+                            "type": "text_delta",
+                            "text": format!("{} done", &placeholder[split..])
+                        }
+                    })
+                ),
+                format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": format!("{{\"token\":\"{}", &placeholder[..split])
+                        }
+                    })
+                ),
+                format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": format!("{}\"}}", &placeholder[split..])
+                        }
+                    })
+                ),
+                "data: [DONE]\n\n".to_string(),
+            ]
+        },
+    )
+    .await;
+    assert!(claude_body.contains("keepalive"));
+    assert!(claude_body.contains("partial_json"));
+    assert!(claude_body.contains("[DONE]"));
+    assert!(claude_body.contains("claude-sse-secret-1234567890"));
+
+    let gemini_body = run_proxy_sse_case(
+        "gemini-sse-secret-1234567890",
+        "GEMINI_SSE_SECRET",
+        "/v1beta/models/gemini-1.5-pro:streamGenerateContent?alt=sse",
+        |placeholder| {
+            let split = placeholder.len() / 2;
+            vec![
+                format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "candidates": [{
+                            "content": {
+                                "parts": [{
+                                    "text": format!("Gemini {}", &placeholder[..split])
+                                }]
+                            }
+                        }]
+                    })
+                ),
+                format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "candidates": [{
+                            "content": {
+                                "parts": [
+                                    {"functionCall": {"name": "noop"}},
+                                    {"text": format!("{} done", &placeholder[split..])}
+                                ]
+                            }
+                        }]
+                    })
+                ),
+            ]
+        },
+    )
+    .await;
+    assert!(gemini_body.contains("functionCall"));
+    assert!(gemini_body.contains("gemini-sse-secret-1234567890"));
+
+    let opencode_body = run_proxy_sse_case(
+        "opencode-sse-secret-1234567890",
+        "OPENCODE_SSE_SECRET",
+        "/v1/chat/completions",
+        |placeholder| {
+            let split = placeholder.len() / 2;
+            vec![
+                "retry: 1000\n: keepalive\n\n".to_string(),
+                format!(
+                    "id: chatcmpl-1\nevent: completion.chunk\ndata: {}\n\n",
+                    serde_json::json!({
+                        "choices": [{
+                            "delta": {
+                                "role": "assistant",
+                                "content": format!("OpenCode {}", &placeholder[..split])
+                            }
+                        }]
+                    })
+                ),
+                format!(
+                    "id: chatcmpl-1\nevent: completion.chunk\ndata: {}\n\n",
+                    serde_json::json!({
+                        "choices": [{
+                            "delta": {
+                                "content": format!("{} done", &placeholder[split..])
+                            }
+                        }]
+                    })
+                ),
+                "data: [DONE]\n\n".to_string(),
+            ]
+        },
+    )
+    .await;
+    assert!(opencode_body.contains("completion.chunk"));
+    assert!(opencode_body.contains("[DONE]"));
+    assert!(opencode_body.contains("opencode-sse-secret-1234567890"));
+}
+
+#[tokio::test]
 async fn proxy_mitm_head_response_does_not_wait_for_declared_body() {
     let registry = Arc::new(RwLock::new(SecretRegistry::with_generated_keys()));
     let ca = Arc::new(LocalCa::generate_session().unwrap());
@@ -945,6 +1108,100 @@ where
         .await?;
     stream.write_all(payload).await?;
     stream.write_all(b"\r\n").await
+}
+
+async fn run_proxy_sse_case<F>(
+    secret: &'static str,
+    label: &'static str,
+    request_path: &'static str,
+    build_events: F,
+) -> String
+where
+    F: FnOnce(&str) -> Vec<String>,
+{
+    let mut registry = SecretRegistry::with_generated_keys();
+    let secret_id = registry
+        .ingest(
+            SecretLabel::new(label),
+            SecureBuf::from_slice(secret.as_bytes()),
+        )
+        .unwrap();
+    let placeholder = registry
+        .placeholder_for(secret_id)
+        .unwrap()
+        .as_str()
+        .to_string();
+    let response_events = build_events(&placeholder);
+    let registry = Arc::new(RwLock::new(registry));
+    let ca = Arc::new(LocalCa::generate_session().unwrap());
+
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let target = format!("localhost:{}", upstream_addr.port());
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = upstream_listener.accept().await.unwrap();
+        let (head, body) = read_http_message(&mut stream).await;
+        assert!(head.starts_with(&format!("POST {request_path} HTTP/1.1")));
+        assert!(!head.to_ascii_lowercase().contains("accept-encoding"));
+        let body = String::from_utf8(body).unwrap();
+        assert!(!body.contains(secret));
+
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        for event in response_events {
+            write_http_chunk(&mut stream, event.as_bytes())
+                .await
+                .unwrap();
+        }
+        stream.write_all(b"0\r\n\r\n").await.unwrap();
+    });
+
+    let proxy = spawn_proxy(ProxyConfig {
+        listen_addr: "127.0.0.1:0".to_string(),
+        allowlisted_connect_targets: vec![target.clone()],
+        registry: Arc::clone(&registry),
+        patterns: CredentialPatternSet::builtin(),
+        ca: Some(Arc::clone(&ca)),
+        upstream_tls: false,
+        ..ProxyConfig::default()
+    })
+    .await
+    .unwrap();
+
+    let mut tls = connect_tls_through_proxy(&proxy.url(), &target, &ca).await;
+    let body = format!(r#"{{"prompt":"use {secret}"}}"#);
+    tls.write_all(
+        format!(
+            "POST {request_path} HTTP/1.1\r\n\
+             Host: {target}\r\n\
+             content-type: application/json\r\n\
+             accept-encoding: gzip\r\n\
+             content-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+
+    let (_head, body) = read_http_chunked_message(&mut tls).await;
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        body.contains(secret),
+        "restored SSE body for {label} did not contain the original secret: {body}"
+    );
+    assert!(
+        !body.contains("{{CREBRO_SECRET"),
+        "restored SSE body for {label} leaked a placeholder: {body}"
+    );
+
+    upstream.await.unwrap();
+    body
 }
 
 async fn connect_tls_through_proxy(
