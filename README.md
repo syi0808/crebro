@@ -221,6 +221,18 @@ crebro --tls-keylog-file /tmp/crebro-tls.keys -- codex
 
 Use this only in controlled testing. Delete the key log file after analysis.
 
+### Live Payload Monitor For QA
+
+For live terminal inspection of Crebro-to-provider payloads, use the tshark monitor helper:
+
+```sh
+scripts/chat-payload-monitor.sh -- codex
+```
+
+The helper starts `tshark`, runs `crebro -- <child command>` with `CREBRO_TLS_KEYLOG_FILE`, pretty-prints decrypted JSON/SSE/WebSocket payloads with `jq`, and highlights Crebro placeholders such as `{{CREBRO_SECRET:...}}`. It keeps TLS key logs and tshark scratch files in a temporary directory and deletes them when the session exits.
+
+This is a controlled QA tool for inspecting upstream payloads. TLS key logs can decrypt captured traffic from the session, so do not keep or share them unless that is the explicit QA artifact you intend to preserve.
+
 ## Frequently Asked Questions
 
 ### Can Crebro guarantee that no secret ever leaves my machine?
