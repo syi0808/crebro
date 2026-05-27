@@ -205,6 +205,26 @@ CREBRO_STATS_DIR=/tmp/crebro-stats crebro -- codex
 
 The stats file stores counts by Crebro placeholder id and credential pattern id. It does not store raw secrets, raw prompts, or raw responses.
 
+### Conversation History Sanitizing
+
+Crebro can scan local agent conversation stores and replace handled credentials with random same-length values for safer sharing:
+
+```sh
+crebro sanitize-conversations
+```
+
+The default mode is a dry run. Add `--write` to create backups and rewrite changed records:
+
+```sh
+crebro sanitize-conversations --write
+```
+
+Supported built-in targets cover Codex, Claude, Gemini, and OpenCode conversation stores. Use `--agent codex`, `--agent claude`, `--agent gemini`, or `--agent opencode` to narrow the scan, and repeat `--path <file-or-dir>` for extra targets. Backups default to `~/.crebro/backups/conversations/<timestamp>/`; pass `--backup-dir <path>` to choose another location.
+
+The command uses the same `.env`, environment, and credential pattern rules as proxy redaction. It replaces discovered credentials, `<cb>...</cb>` values found in histories, and high-confidence auto-redact pattern matches. It does not scrub agent auth/config files unless they are under an explicitly included conversation target. Binary protobuf files only support exact replacement of already registered secrets; pattern-only binary matches are reported as unsupported.
+
+Use `--json` for a machine-readable report and `--strict` to fail when unsupported or ambiguous credential-like matches are found.
+
 ### TLS Key Logging For QA
 
 For isolated QA sessions, Crebro can write TLS key logs for its upstream HTTPS connections:

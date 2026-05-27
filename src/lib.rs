@@ -8,6 +8,7 @@ pub mod process;
 pub mod proxy;
 pub mod redact;
 pub mod restore;
+pub mod sanitize;
 pub mod secrets;
 pub mod stats;
 

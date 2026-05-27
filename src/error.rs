@@ -29,5 +29,7 @@ pub enum CrebroError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
     Http(#[from] reqwest::Error),
 }
