@@ -12,7 +12,7 @@ Crebro runs as a one-shot wrapper around a child agent process:
 crebro -- codex
 ```
 
-It starts a loopback gateway or local proxy, launches the child command, routes supported provider traffic through Crebro, redacts discovered secrets before the request reaches the upstream LLM provider, and restores Crebro placeholders in the local response stream before the child agent sees the answer.
+It starts a child-scoped local proxy, launches the child command with proxy and session CA environment variables, redacts discovered secrets before supported provider traffic reaches the upstream LLM provider, and restores Crebro placeholders in the local response stream before the child agent sees the answer.
 
 The current implementation focuses on:
 
@@ -40,7 +40,6 @@ Crebro is intended to protect coding-agent traffic broadly. The first tested sco
 
 Verified local routing surfaces:
 
-- Codex CLI 0.133.0 using OpenAI-compatible routing through `OPENAI_BASE_URL`
 - Codex ChatGPT auth traffic through child-scoped proxy environment variables and `chatgpt.com/backend-api`
 
 Manual Wireshark QA was also run with Crebro TLS key logging enabled. The capture was decrypted in Wireshark to inspect the outbound provider payload during a real Codex session.
@@ -94,41 +93,27 @@ crebro --help
 crebro -- codex
 ```
 
-Crebro launches the child agent, removes raw provider keys from the child environment, configures the selected local routing path, and exits with the child process status.
+Crebro launches the child agent, keeps the child environment's normal auth settings, adds proxy and session CA variables, and exits with the child process status.
 
-### Automatic Routing Choice
+### Proxy-Only Routing
 
 ```sh
 crebro -- codex
 ```
 
-Crebro does not ask the user to choose a routing mode. It uses the native provider gateway path when a provider API key is configured. Without a provider API key, auth-first agents such as Codex, Claude, Gemini, and OpenCode use a child-scoped local proxy so their normal login/auth flows stay in control instead of receiving placeholder API keys.
+Crebro does not ask the user to choose a routing mode. The CLI always uses a child-scoped local proxy so auth-first agents such as Codex, Claude, Gemini, and OpenCode keep their normal login and API key behavior.
 
-The proxy path starts a local explicit proxy, injects proxy environment variables into the child process, strips provider key/base URL overrides, and uses a session-local CA for allowlisted MITM traffic. This is an implementation detail driven by the agent's auth path, not a feature toggle the user is expected to manage.
+The proxy path starts a local explicit proxy, injects proxy environment variables into the child process, and uses a session-local CA for allowlisted MITM traffic. Provider API key and provider base URL environment variables remain available to the child; Crebro does not replace auth with placeholder keys.
 
-### Upstream URL
+### Provider Auth Environment
 
-Crebro infers the default upstream URL for supported commands. Override it when needed:
-
-```sh
-crebro --upstream-url https://api.openai.com -- codex
-```
-
-or:
+API key users can keep using the provider variables expected by their child CLI:
 
 ```sh
-CREBRO_UPSTREAM_URL=https://api.openai.com crebro -- codex
+OPENAI_API_KEY=sk-example crebro -- codex
 ```
 
-### Provider API Key
-
-Crebro can read provider keys from the environment or from `--provider-api-key`.
-
-```sh
-CREBRO_PROVIDER_API_KEY=sk-example crebro -- codex
-```
-
-Known provider key variables include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, and `OPENCODE_API_KEY`.
+Known provider key variables include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, and `OPENCODE_API_KEY`. Crebro discovers these values for redaction, but leaves them in the child environment so the child CLI can authenticate normally.
 
 ### Environment File
 

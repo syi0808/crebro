@@ -3,7 +3,6 @@ pub mod error;
 pub mod gateway;
 pub mod hardening;
 pub mod logging;
-pub mod mode;
 pub mod patterns;
 pub mod process;
 pub mod proxy;

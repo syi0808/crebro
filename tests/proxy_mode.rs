@@ -2,9 +2,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use crebro::{
     cli::{Cli, run_with_cli},
-    mode::{EffectiveMode, resolve_effective_mode},
     patterns::CredentialPatternSet,
-    process::{ProxyChildEnvConfig, proxy_sanitized_environment},
+    process::{ProxyChildEnvConfig, proxy_child_environment},
     proxy::{LocalCa, ProxyConfig, spawn_proxy},
     secrets::{SecretLabel, SecretRegistry, SecureBuf},
 };
@@ -17,22 +16,8 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 
 #[test]
-fn mode_selection_uses_proxy_for_default_auth_agents_without_provider_key() {
-    for command in ["codex", "claude", "gemini", "opencode"] {
-        assert_eq!(
-            resolve_effective_mode(&[command.to_string()], false),
-            EffectiveMode::Proxy
-        );
-        assert_eq!(
-            resolve_effective_mode(&[command.to_string()], true),
-            EffectiveMode::Native
-        );
-    }
-}
-
-#[test]
-fn proxy_child_environment_sets_proxy_ca_and_strips_provider_keys() {
-    let env = proxy_sanitized_environment(
+fn proxy_child_environment_sets_proxy_ca_and_preserves_auth_env() {
+    let env = proxy_child_environment(
         [
             ("OPENAI_API_KEY".to_string(), "sk-real".to_string()),
             ("ANTHROPIC_API_KEY".to_string(), "sk-ant-real".to_string()),
@@ -40,7 +25,7 @@ fn proxy_child_environment_sets_proxy_ca_and_strips_provider_keys() {
             ("OPENCODE_API_KEY".to_string(), "opencode-real".to_string()),
             (
                 "OPENAI_BASE_URL".to_string(),
-                "https://api.openai.com".to_string(),
+                "https://example.invalid".to_string(),
             ),
             ("PATH".to_string(), "/usr/bin".to_string()),
             (
@@ -55,11 +40,18 @@ fn proxy_child_environment_sets_proxy_ca_and_strips_provider_keys() {
     );
 
     assert_eq!(env.get("PATH").unwrap(), "/usr/bin");
-    assert!(!env.contains_key("OPENAI_API_KEY"));
-    assert!(!env.contains_key("ANTHROPIC_API_KEY"));
-    assert!(!env.contains_key("GEMINI_API_KEY"));
-    assert!(!env.contains_key("OPENCODE_API_KEY"));
-    assert!(!env.contains_key("OPENAI_BASE_URL"));
+    assert_eq!(env.get("OPENAI_API_KEY").unwrap(), "sk-real");
+    assert_eq!(env.get("ANTHROPIC_API_KEY").unwrap(), "sk-ant-real");
+    assert_eq!(env.get("GEMINI_API_KEY").unwrap(), "gemini-real");
+    assert_eq!(env.get("OPENCODE_API_KEY").unwrap(), "opencode-real");
+    assert_eq!(
+        env.get("OPENAI_BASE_URL").unwrap(),
+        "https://example.invalid"
+    );
+    assert!(
+        !env.values()
+            .any(|value| value == "crebro-local-placeholder")
+    );
     assert_eq!(env.get("HTTPS_PROXY").unwrap(), "http://127.0.0.1:54321");
     assert_eq!(env.get("HTTP_PROXY").unwrap(), "http://127.0.0.1:54321");
     assert_eq!(env.get("https_proxy").unwrap(), "http://127.0.0.1:54321");
@@ -166,19 +158,17 @@ async fn proxy_tunnels_allowlisted_connect_target() {
 }
 
 #[tokio::test]
-async fn cli_proxy_mode_runs_child_with_proxy_environment_without_upstream_url() {
-    let codex = codex_shell_shim("proxy-child-env");
+async fn cli_runs_any_child_with_proxy_environment() {
+    let child = shell_shim("proxy-child-env", "custom-agent");
     let code = run_with_cli(Cli {
         listen_addr: "127.0.0.1:0".to_string(),
-        upstream_url: None,
-        provider_api_key: None,
         env_file: std::env::temp_dir().join("crebro-test-missing.env"),
         patterns_file: None,
         stats_dir: None,
         tls_keylog_file: None,
         no_placeholder_guidance: false,
         command: vec![
-            codex.to_string_lossy().to_string(),
+            child.to_string_lossy().to_string(),
             "-c".to_string(),
             r#"test -n "$HTTPS_PROXY" && test "$HTTPS_PROXY" = "$CREBRO_PROXY_URL""#.to_string(),
         ],
@@ -194,18 +184,16 @@ async fn cli_proxy_mode_accepts_upstream_tls_keylog_file_configuration() {
     let keylog_dir = unique_temp_dir("proxy-tls-keylog");
     std::fs::create_dir_all(&keylog_dir).unwrap();
     let keylog_path = keylog_dir.join("tls.keys");
-    let codex = codex_shell_shim("proxy-tls-keylog-child");
+    let child = shell_shim("proxy-tls-keylog-child", "custom-agent");
     let code = run_with_cli(Cli {
         listen_addr: "127.0.0.1:0".to_string(),
-        upstream_url: None,
-        provider_api_key: None,
         env_file: std::env::temp_dir().join("crebro-test-missing.env"),
         patterns_file: None,
         stats_dir: None,
         tls_keylog_file: Some(keylog_path.clone()),
         no_placeholder_guidance: false,
         command: vec![
-            codex.to_string_lossy().to_string(),
+            child.to_string_lossy().to_string(),
             "-c".to_string(),
             "true".to_string(),
         ],
@@ -581,6 +569,8 @@ async fn proxy_mitm_http_json_redacts_request_and_restores_response() {
         .to_string();
     let registry = Arc::new(RwLock::new(registry));
     let ca = Arc::new(LocalCa::generate_session().unwrap());
+    let stats_dir = unique_temp_dir("proxy-http-stats");
+    let stats_path = stats_dir.join("stats.json");
 
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
@@ -615,6 +605,7 @@ async fn proxy_mitm_http_json_redacts_request_and_restores_response() {
         allowlisted_connect_targets: vec![target.clone()],
         registry: Arc::clone(&registry),
         patterns: CredentialPatternSet::builtin(),
+        stats_path: Some(stats_path.clone()),
         ca: Some(Arc::clone(&ca)),
         upstream_tls: false,
         ..ProxyConfig::default()
@@ -646,6 +637,11 @@ async fn proxy_mitm_http_json_redacts_request_and_restores_response() {
     assert!(!body.contains("{{CREBRO_SECRET"));
 
     upstream.await.unwrap();
+    let stats = std::fs::read_to_string(&stats_path).unwrap();
+    assert!(stats.contains("HTTP_SECRET"));
+    assert!(stats.contains(&placeholder));
+    assert!(stats.contains("\"count\": 1"));
+    assert!(!stats.contains(secret));
 }
 
 #[tokio::test]
@@ -1321,12 +1317,12 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
     ))
 }
 
-fn codex_shell_shim(prefix: &str) -> PathBuf {
+fn shell_shim(prefix: &str, name: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = unique_temp_dir(prefix);
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("codex");
+    let path = dir.join(name);
     std::fs::write(&path, b"#!/bin/sh\nexec /bin/sh \"$@\"\n").unwrap();
     let mut permissions = std::fs::metadata(&path).unwrap().permissions();
     permissions.set_mode(0o700);

@@ -2,7 +2,6 @@ use std::{
     convert::Infallible,
     io::Write,
     path::PathBuf,
-    process::Stdio,
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
@@ -16,9 +15,7 @@ use axum::{
     routing::any,
 };
 use crebro::{
-    cli::{Cli, infer_default_upstream_url, run_with_cli},
     gateway::{GatewayConfig, spawn_gateway},
-    process::sanitized_environment,
     secrets::{SecretId, SecretLabel, SecretRegistry, SecureBuf},
 };
 use futures_util::{StreamExt, stream};
@@ -77,16 +74,6 @@ async fn mock_headered_handler(
     response
 }
 
-async fn mock_echo_handler(
-    State(state): State<MockState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> impl IntoResponse {
-    state.bodies.lock().await.push(body.to_vec());
-    state.request_headers.lock().await.push(headers);
-    (StatusCode::OK, body.to_vec())
-}
-
 async fn spawn_mock_upstream(
     response: Vec<u8>,
 ) -> (String, Arc<Mutex<Vec<Vec<u8>>>>, Arc<Mutex<Vec<HeaderMap>>>) {
@@ -127,25 +114,6 @@ async fn spawn_headered_mock_upstream(
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), bodies, request_headers)
-}
-
-async fn spawn_echo_upstream() -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
-    let bodies = Arc::new(Mutex::new(Vec::new()));
-    let request_headers = Arc::new(Mutex::new(Vec::new()));
-    let state = MockState {
-        bodies: Arc::clone(&bodies),
-        request_headers,
-        response: Arc::new(Vec::new()),
-    };
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = Router::new()
-        .fallback(any(mock_echo_handler))
-        .with_state(state);
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}"), bodies)
 }
 
 async fn mock_chunked_handler(
@@ -253,59 +221,6 @@ fn split_inside(text: &str, needle: &str) -> Vec<Vec<u8>> {
     let split = text.find(needle).unwrap() + needle.len() / 2;
     let bytes = text.as_bytes();
     vec![bytes[..split].to_vec(), bytes[split..].to_vec()]
-}
-
-#[test]
-fn child_env_does_not_receive_provider_key() {
-    let env = sanitized_environment(
-        [
-            (
-                "OPENAI_API_KEY".to_string(),
-                "sk-real-provider-key".to_string(),
-            ),
-            (
-                "ANTHROPIC_AUTH_TOKEN".to_string(),
-                "anthropic-real-provider-key".to_string(),
-            ),
-            (
-                "OPENCODE_API_KEY".to_string(),
-                "opencode-real-provider-key".to_string(),
-            ),
-            ("PATH".to_string(), "/usr/bin".to_string()),
-        ],
-        "http://127.0.0.1:1234",
-    );
-    assert_eq!(
-        env.get("OPENAI_API_KEY").unwrap(),
-        "crebro-local-placeholder"
-    );
-    assert_ne!(env.get("OPENAI_API_KEY").unwrap(), "sk-real-provider-key");
-    assert_eq!(
-        env.get("ANTHROPIC_AUTH_TOKEN").unwrap(),
-        "crebro-local-placeholder"
-    );
-    assert_ne!(
-        env.get("ANTHROPIC_AUTH_TOKEN").unwrap(),
-        "anthropic-real-provider-key"
-    );
-    assert_eq!(
-        env.get("OPENCODE_API_KEY").unwrap(),
-        "crebro-local-placeholder"
-    );
-    assert_ne!(
-        env.get("OPENCODE_API_KEY").unwrap(),
-        "opencode-real-provider-key"
-    );
-    assert_eq!(env.get("PATH").unwrap(), "/usr/bin");
-    assert_eq!(env.get("OPENAI_BASE_URL").unwrap(), "http://127.0.0.1:1234");
-    assert_eq!(
-        env.get("CLAUDE_CODE_API_BASE_URL").unwrap(),
-        "http://127.0.0.1:1234"
-    );
-    assert_eq!(
-        env.get("GOOGLE_GEMINI_BASE_URL").unwrap(),
-        "http://127.0.0.1:1234"
-    );
 }
 
 #[tokio::test]
@@ -1013,103 +928,6 @@ async fn configured_auth_uses_gemini_header_for_stable_gemini_routes() {
         );
         assert!(request_headers[0].get("authorization").is_none());
     }
-}
-
-#[tokio::test]
-async fn cli_one_shot_wrapper_returns_child_exit_status() {
-    let (upstream_url, _, _) = spawn_mock_upstream(b"{}".to_vec()).await;
-    let code = run_with_cli(Cli {
-        listen_addr: "127.0.0.1:0".to_string(),
-        upstream_url: Some(upstream_url),
-        provider_api_key: None,
-        env_file: std::env::temp_dir().join("crebro-test-missing.env"),
-        patterns_file: None,
-        stats_dir: Some(unique_temp_dir("cli-exit-stats")),
-        tls_keylog_file: None,
-        no_placeholder_guidance: false,
-        command: vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            "exit 7".to_string(),
-        ],
-    })
-    .await
-    .unwrap();
-
-    assert_eq!(code, 7);
-}
-
-#[tokio::test]
-async fn cli_wrapper_routes_child_request_through_gateway() {
-    if std::process::Command::new("python3")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_err()
-    {
-        return;
-    }
-
-    let secret = "cli-child-secret-1234567890";
-    let (upstream_url, bodies) = spawn_echo_upstream().await;
-    let script = format!(
-        r#"
-import json
-import os
-import sys
-import urllib.request
-
-secret = {secret:?}
-url = os.environ["CREBRO_GATEWAY_URL"] + "/v1/chat/completions"
-payload = json.dumps({{"messages": [{{"role": "user", "content": "use " + secret}}]}}).encode()
-request = urllib.request.Request(url, data=payload, headers={{"content-type": "application/json"}}, method="POST")
-body = urllib.request.urlopen(request, timeout=5).read().decode()
-if secret not in body or "{{CREBRO_SECRET" in body:
-    sys.exit(9)
-"#
-    );
-    let code = run_with_cli(Cli {
-        listen_addr: "127.0.0.1:0".to_string(),
-        upstream_url: Some(upstream_url),
-        provider_api_key: Some(secret.to_string()),
-        env_file: std::env::temp_dir().join("crebro-test-missing.env"),
-        patterns_file: None,
-        stats_dir: Some(unique_temp_dir("cli-wrapper-stats")),
-        tls_keylog_file: None,
-        no_placeholder_guidance: false,
-        command: vec!["python3".to_string(), "-c".to_string(), script],
-    })
-    .await
-    .unwrap();
-
-    assert_eq!(code, 0);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let bodies = bodies.lock().await;
-    assert_eq!(bodies.len(), 1);
-    let upstream_body = String::from_utf8_lossy(&bodies[0]);
-    assert!(!upstream_body.contains(secret));
-    assert!(upstream_body.contains("{{CREBRO_SECRET:v1:CREBRO_PROVIDER_API_KEY:"));
-}
-
-#[test]
-fn zero_config_upstream_url_infers_supported_agent_defaults() {
-    assert_eq!(
-        infer_default_upstream_url(&["codex".to_string()]).unwrap(),
-        "https://api.openai.com"
-    );
-    assert_eq!(
-        infer_default_upstream_url(&["claude".to_string()]).unwrap(),
-        "https://api.anthropic.com"
-    );
-    assert_eq!(
-        infer_default_upstream_url(&["gemini".to_string()]).unwrap(),
-        "https://generativelanguage.googleapis.com"
-    );
-    assert_eq!(
-        infer_default_upstream_url(&["opencode".to_string()]).unwrap(),
-        "https://api.openai.com"
-    );
 }
 
 #[tokio::test]

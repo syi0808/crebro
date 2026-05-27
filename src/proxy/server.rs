@@ -14,8 +14,12 @@ use tokio::{
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::{
-    CrebroError, Result, gateway::tls::open_file_key_log, patterns::CredentialPatternSet,
-    redact::JsonSanitizer, secrets::SecretRegistry,
+    CrebroError, Result,
+    gateway::tls::open_file_key_log,
+    patterns::CredentialPatternSet,
+    redact::{JsonSanitizer, SanitizerReport},
+    secrets::SecretRegistry,
+    stats::StatsRecorder,
 };
 
 use super::{ca::LocalCa, websocket::relay_with_rewrite};
@@ -38,6 +42,7 @@ pub struct ProxyConfig {
     pub registry: Arc<RwLock<SecretRegistry>>,
     pub patterns: Arc<CredentialPatternSet>,
     pub cache_entries: usize,
+    pub stats_path: Option<PathBuf>,
     pub mitm: bool,
     pub upstream_tls: bool,
     pub tls_keylog_file: Option<PathBuf>,
@@ -54,6 +59,7 @@ impl std::fmt::Debug for ProxyConfig {
                 &self.allowlisted_connect_targets,
             )
             .field("cache_entries", &self.cache_entries)
+            .field("stats_path", &self.stats_path)
             .field("mitm", &self.mitm)
             .field("upstream_tls", &self.upstream_tls)
             .field("tls_keylog_file", &self.tls_keylog_file)
@@ -74,6 +80,7 @@ impl Default for ProxyConfig {
             registry: Arc::new(RwLock::new(SecretRegistry::with_generated_keys())),
             patterns: CredentialPatternSet::builtin(),
             cache_entries: 4096,
+            stats_path: None,
             mitm: true,
             upstream_tls: true,
             tls_keylog_file: None,
@@ -88,6 +95,7 @@ struct ProxyState {
     allowlisted_connect_targets: Arc<HashSet<String>>,
     registry: Arc<RwLock<SecretRegistry>>,
     sanitizer: Arc<Mutex<JsonSanitizer>>,
+    stats: StatsRecorder,
     mitm: bool,
     upstream_tls: bool,
     upstream_key_log: Option<Arc<dyn rustls::KeyLog>>,
@@ -159,6 +167,7 @@ pub async fn spawn_proxy(config: ProxyConfig) -> Result<ProxyHandle> {
                 config.placeholder_guidance,
             ),
         )),
+        stats: StatsRecorder::new(config.stats_path),
         mitm: config.mitm,
         upstream_tls: config.upstream_tls,
         upstream_key_log,
@@ -358,6 +367,7 @@ where
         &mut upstream,
         Arc::clone(&state.sanitizer),
         Arc::clone(&state.registry),
+        state.stats.clone(),
     )
     .await
 }
@@ -447,7 +457,16 @@ async fn sanitize_http_request(mut request: HttpHead, state: &ProxyState) -> Res
     let sanitized = {
         let mut sanitizer = state.sanitizer.lock().await;
         let mut registry = state.registry.write().await;
-        sanitize_http_body(head, &body, &mut sanitizer, &mut registry)?
+        match sanitize_http_body(head, &body, &mut sanitizer, &mut registry) {
+            Ok((sanitized, report)) => {
+                state.stats.record_sanitizer_report(&registry, &report);
+                sanitized
+            }
+            Err(err) => {
+                state.stats.record_error(&err);
+                return Err(err);
+            }
+        }
     };
     if sanitized == body && !has_header(head, "accept-encoding") {
         return Ok(request.bytes);
@@ -506,15 +525,14 @@ fn sanitize_http_body(
     body: &[u8],
     sanitizer: &mut JsonSanitizer,
     registry: &mut SecretRegistry,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, SanitizerReport)> {
     if is_json_http_body(head) {
-        let (sanitized, _report) = sanitizer.sanitize_json(body, registry)?;
-        return Ok(sanitized);
+        return sanitizer.sanitize_json(body, registry);
     }
     let text = std::str::from_utf8(body)
         .map_err(|_| CrebroError::Gateway("HTTP text body was not UTF-8".into()))?;
-    let (sanitized, _report) = sanitizer.sanitize_text_payload(text, registry)?;
-    Ok(sanitized.into_bytes())
+    let (sanitized, report) = sanitizer.sanitize_text_payload(text, registry)?;
+    Ok((sanitized.into_bytes(), report))
 }
 
 async fn forward_chunked_http_response<C, R>(

@@ -1,51 +1,8 @@
-use std::{collections::HashMap, env, path::PathBuf, process::ExitStatus};
+use std::{collections::HashMap, path::PathBuf, process::ExitStatus};
 
 use tokio::process::Command;
 
-use zeroize::Zeroize;
-
-use crate::{CrebroError, Result, secrets::SecureBuf};
-
-pub const PROVIDER_KEY_ENV_NAMES: &[&str] = &[
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "GEMINI_API_KEY",
-    "GOOGLE_API_KEY",
-    "GOOGLE_GENERATIVE_AI_API_KEY",
-    "OPENCODE_API_KEY",
-];
-
-pub const PROVIDER_BASE_URL_ENV_NAMES: &[&str] = &[
-    "OPENAI_BASE_URL",
-    "ANTHROPIC_BASE_URL",
-    "CLAUDE_CODE_API_BASE_URL",
-    "GEMINI_BASE_URL",
-    "GOOGLE_GEMINI_BASE_URL",
-    "CREBRO_GATEWAY_URL",
-];
-
-pub fn child_env_overrides(gateway_url: &str) -> HashMap<String, String> {
-    let mut env = PROVIDER_KEY_ENV_NAMES
-        .iter()
-        .map(|key| ((*key).to_string(), "crebro-local-placeholder".to_string()))
-        .collect::<HashMap<_, _>>();
-    env.extend([
-        ("OPENAI_BASE_URL".to_string(), gateway_url.to_string()),
-        ("ANTHROPIC_BASE_URL".to_string(), gateway_url.to_string()),
-        (
-            "CLAUDE_CODE_API_BASE_URL".to_string(),
-            gateway_url.to_string(),
-        ),
-        ("GEMINI_BASE_URL".to_string(), gateway_url.to_string()),
-        (
-            "GOOGLE_GEMINI_BASE_URL".to_string(),
-            gateway_url.to_string(),
-        ),
-        ("CREBRO_GATEWAY_URL".to_string(), gateway_url.to_string()),
-    ]);
-    env
-}
+use crate::{CrebroError, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyChildEnvConfig {
@@ -77,19 +34,7 @@ pub fn proxy_child_env_overrides(config: &ProxyChildEnvConfig) -> HashMap<String
     env
 }
 
-pub fn sanitized_environment<I>(base_env: I, gateway_url: &str) -> HashMap<String, String>
-where
-    I: IntoIterator<Item = (String, String)>,
-{
-    let mut env = base_env.into_iter().collect::<HashMap<_, _>>();
-    for key in PROVIDER_KEY_ENV_NAMES {
-        env.remove(*key);
-    }
-    env.extend(child_env_overrides(gateway_url));
-    env
-}
-
-pub fn proxy_sanitized_environment<I>(
+pub fn proxy_child_environment<I>(
     base_env: I,
     config: &ProxyChildEnvConfig,
 ) -> HashMap<String, String>
@@ -97,12 +42,6 @@ where
     I: IntoIterator<Item = (String, String)>,
 {
     let mut env = base_env.into_iter().collect::<HashMap<_, _>>();
-    for key in PROVIDER_KEY_ENV_NAMES {
-        env.remove(*key);
-    }
-    for key in PROVIDER_BASE_URL_ENV_NAMES {
-        env.remove(*key);
-    }
     env.extend(proxy_child_env_overrides(config));
     merge_loopback_no_proxy(&mut env, "NO_PROXY");
     merge_loopback_no_proxy(&mut env, "no_proxy");
@@ -130,31 +69,6 @@ fn merge_loopback_no_proxy(env: &mut HashMap<String, String>, key: &str) {
     env.insert(key.to_string(), values.join(","));
 }
 
-pub fn first_provider_key_from_env() -> Option<(String, SecureBuf)> {
-    for key in PROVIDER_KEY_ENV_NAMES {
-        let Ok(mut value) = env::var(key) else {
-            continue;
-        };
-        if value.is_empty() {
-            continue;
-        }
-        let buf = SecureBuf::from_slice(value.as_bytes());
-        value.zeroize();
-        return Some(((*key).to_string(), buf));
-    }
-    None
-}
-
-pub fn provider_key_env_present() -> bool {
-    PROVIDER_KEY_ENV_NAMES
-        .iter()
-        .any(|key| env::var(key).is_ok_and(|value| !value.is_empty()))
-}
-
-pub fn build_child_command(command: &[String], gateway_url: &str) -> Result<Command> {
-    build_child_command_with_env(command, sanitized_environment(env::vars(), gateway_url))
-}
-
 pub fn build_child_command_with_env(
     command: &[String],
     child_env: HashMap<String, String>,
@@ -167,10 +81,6 @@ pub fn build_child_command_with_env(
     cmd.env_clear();
     cmd.envs(child_env);
     Ok(cmd)
-}
-
-pub async fn run_child(command: &[String], gateway_url: &str) -> Result<ExitStatus> {
-    run_child_with_env(command, sanitized_environment(env::vars(), gateway_url)).await
 }
 
 pub async fn run_child_with_env(

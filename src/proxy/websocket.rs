@@ -5,7 +5,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     CrebroError, Result, redact::JsonSanitizer, restore::PlaceholderMatcher,
-    secrets::SecretRegistry,
+    secrets::SecretRegistry, stats::StatsRecorder,
 };
 
 const OPCODE_CONTINUATION: u8 = 0x0;
@@ -28,6 +28,7 @@ pub async fn relay_with_rewrite<C, U>(
     upstream: &mut U,
     sanitizer: Arc<Mutex<JsonSanitizer>>,
     registry: Arc<RwLock<SecretRegistry>>,
+    stats: StatsRecorder,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -49,6 +50,7 @@ where
                     upstream,
                     Arc::clone(&sanitizer),
                     Arc::clone(&registry),
+                    stats.clone(),
                     &mut client_text,
                 ).await? {
                     return Ok(());
@@ -84,6 +86,7 @@ async fn handle_client_frame<W>(
     upstream: &mut W,
     sanitizer: Arc<Mutex<JsonSanitizer>>,
     registry: Arc<RwLock<SecretRegistry>>,
+    stats: StatsRecorder,
     buffer: &mut MessageBuffer,
 ) -> Result<bool>
 where
@@ -93,7 +96,8 @@ where
         OPCODE_TEXT => {
             if frame.fin {
                 let payload =
-                    sanitize_client_text(payload_ref(&frame), &sanitizer, &registry).await?;
+                    sanitize_client_text(payload_ref(&frame), &sanitizer, &registry, &stats)
+                        .await?;
                 write_frame(upstream, true, OPCODE_TEXT, &payload, true).await?;
             } else {
                 buffer.active_opcode = Some(OPCODE_TEXT);
@@ -105,7 +109,7 @@ where
             if frame.fin {
                 let payload = std::mem::take(&mut buffer.payload);
                 buffer.active_opcode = None;
-                let payload = sanitize_client_text(&payload, &sanitizer, &registry).await?;
+                let payload = sanitize_client_text(&payload, &sanitizer, &registry, &stats).await?;
                 write_frame(upstream, true, OPCODE_TEXT, &payload, true).await?;
             }
         }
@@ -224,17 +228,34 @@ async fn sanitize_client_text(
     payload: &[u8],
     sanitizer: &Arc<Mutex<JsonSanitizer>>,
     registry: &Arc<RwLock<SecretRegistry>>,
+    stats: &StatsRecorder,
 ) -> Result<Vec<u8>> {
     let mut sanitizer = sanitizer.lock().await;
     let mut registry = registry.write().await;
     if serde_json::from_slice::<serde_json::Value>(payload).is_ok() {
-        let (sanitized, _report) = sanitizer.sanitize_json(payload, &mut registry)?;
-        return Ok(sanitized);
+        return match sanitizer.sanitize_json(payload, &mut registry) {
+            Ok((sanitized, report)) => {
+                stats.record_sanitizer_report(&registry, &report);
+                Ok(sanitized)
+            }
+            Err(err) => {
+                stats.record_error(&err);
+                Err(err)
+            }
+        };
     }
     let text = str::from_utf8(payload)
         .map_err(|_| CrebroError::Gateway("websocket text frame was not UTF-8".into()))?;
-    let (sanitized, _report) = sanitizer.sanitize_text_payload(text, &mut registry)?;
-    Ok(sanitized.into_bytes())
+    match sanitizer.sanitize_text_payload(text, &mut registry) {
+        Ok((sanitized, report)) => {
+            stats.record_sanitizer_report(&registry, &report);
+            Ok(sanitized.into_bytes())
+        }
+        Err(err) => {
+            stats.record_error(&err);
+            Err(err)
+        }
+    }
 }
 
 async fn restore_upstream_text(
