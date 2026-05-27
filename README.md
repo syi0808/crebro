@@ -57,7 +57,7 @@ Evidence from that run is included below.
 ### Requirements
 
 - Rust toolchain with Rust 2024 edition support
-- A supported child agent command, such as `codex`
+- A supported child agent command, such as `codex`, `claude`, `gemini`, or `opencode`
 
 ### Install From crates.io
 
@@ -88,13 +88,13 @@ crebro --help
 
 ## Usage
 
-### Basic Codex Wrapper
+### Basic Agent Wrapper
 
 ```sh
 crebro -- codex
 ```
 
-Crebro launches `codex`, removes raw provider keys from the child environment, sets provider base URL variables to the local Crebro gateway, and exits with the child process status.
+Crebro launches the child agent, removes raw provider keys from the child environment, configures the selected local routing path, and exits with the child process status.
 
 ### Automatic Routing Choice
 
@@ -102,9 +102,9 @@ Crebro launches `codex`, removes raw provider keys from the child environment, s
 crebro -- codex
 ```
 
-Crebro does not ask the user to choose a routing mode. It uses the native provider gateway path when the child command can be routed through provider base URL variables. When Codex is running through ChatGPT auth and there is no provider API key, Crebro uses a child-scoped local proxy because that traffic does not honor `OPENAI_BASE_URL`.
+Crebro does not ask the user to choose a routing mode. It uses the native provider gateway path when a provider API key is configured. Without a provider API key, auth-first agents such as Codex, Claude, Gemini, and OpenCode use a child-scoped local proxy so their normal login/auth flows stay in control instead of receiving placeholder API keys.
 
-The proxy path starts a local explicit proxy, injects proxy environment variables into the child process, and uses a session-local CA for allowlisted MITM traffic. This is an implementation detail driven by the agent's auth path, not a feature toggle the user is expected to manage.
+The proxy path starts a local explicit proxy, injects proxy environment variables into the child process, strips provider key/base URL overrides, and uses a session-local CA for allowlisted MITM traffic. This is an implementation detail driven by the agent's auth path, not a feature toggle the user is expected to manage.
 
 ### Upstream URL
 

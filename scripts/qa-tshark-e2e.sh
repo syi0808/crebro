@@ -19,8 +19,8 @@ Environment overrides:
 
 The script starts sudo tshark, runs the debug Crebro binary with TLS key logging
 enabled, then stops capture and writes a decrypted payload TSV. Provider key
-environment variables are cleared for this QA run so Codex ChatGPT-auth traffic
-uses Crebro's automatic proxy path.
+environment variables are cleared for this QA run so supported auth-first agents
+use Crebro's automatic proxy path.
 USAGE
 }
 

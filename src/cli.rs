@@ -100,7 +100,7 @@ pub async fn run_with_cli(mut cli: Cli) -> Result<i32> {
 
     if effective_mode == EffectiveMode::Proxy {
         tracing::warn!(
-            "Crebro proxy mode selected for child process; local MITM is enabled for allowlisted targets and ChatGPT auth tokens remain visible to the child and upstream"
+            "Crebro proxy mode selected for child process; local MITM is enabled for allowlisted targets and auth tokens remain visible to the child and upstream"
         );
         let proxy = spawn_proxy(ProxyConfig {
             listen_addr: cli.listen_addr,

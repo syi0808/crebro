@@ -17,19 +17,17 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 
 #[test]
-fn mode_selection_uses_proxy_for_codex_without_provider_key() {
-    assert_eq!(
-        resolve_effective_mode(&["/opt/homebrew/bin/codex".to_string()], false),
-        EffectiveMode::Proxy
-    );
-    assert_eq!(
-        resolve_effective_mode(&["codex".to_string()], true),
-        EffectiveMode::Native
-    );
-    assert_eq!(
-        resolve_effective_mode(&["claude".to_string()], false),
-        EffectiveMode::Native
-    );
+fn mode_selection_uses_proxy_for_default_auth_agents_without_provider_key() {
+    for command in ["codex", "claude", "gemini", "opencode"] {
+        assert_eq!(
+            resolve_effective_mode(&[command.to_string()], false),
+            EffectiveMode::Proxy
+        );
+        assert_eq!(
+            resolve_effective_mode(&[command.to_string()], true),
+            EffectiveMode::Native
+        );
+    }
 }
 
 #[test]
@@ -37,6 +35,9 @@ fn proxy_child_environment_sets_proxy_ca_and_strips_provider_keys() {
     let env = proxy_sanitized_environment(
         [
             ("OPENAI_API_KEY".to_string(), "sk-real".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "sk-ant-real".to_string()),
+            ("GEMINI_API_KEY".to_string(), "gemini-real".to_string()),
+            ("OPENCODE_API_KEY".to_string(), "opencode-real".to_string()),
             (
                 "OPENAI_BASE_URL".to_string(),
                 "https://api.openai.com".to_string(),
@@ -55,6 +56,9 @@ fn proxy_child_environment_sets_proxy_ca_and_strips_provider_keys() {
 
     assert_eq!(env.get("PATH").unwrap(), "/usr/bin");
     assert!(!env.contains_key("OPENAI_API_KEY"));
+    assert!(!env.contains_key("ANTHROPIC_API_KEY"));
+    assert!(!env.contains_key("GEMINI_API_KEY"));
+    assert!(!env.contains_key("OPENCODE_API_KEY"));
     assert!(!env.contains_key("OPENAI_BASE_URL"));
     assert_eq!(env.get("HTTPS_PROXY").unwrap(), "http://127.0.0.1:54321");
     assert_eq!(env.get("HTTP_PROXY").unwrap(), "http://127.0.0.1:54321");
@@ -79,6 +83,23 @@ fn proxy_child_environment_sets_proxy_ca_and_strips_provider_keys() {
     assert!(no_proxy.contains("localhost"));
     assert!(no_proxy.contains("127.0.0.1"));
     assert!(no_proxy.contains("::1"));
+}
+
+#[test]
+fn default_proxy_allowlist_covers_default_auth_agent_hosts() {
+    let config = ProxyConfig::default();
+    for target in [
+        "api.anthropic.com:443",
+        "api.openai.com:443",
+        "chatgpt.com:443",
+        "generativelanguage.googleapis.com:443",
+    ] {
+        assert!(
+            config
+                .allowlisted_connect_targets
+                .contains(&target.to_string())
+        );
+    }
 }
 
 #[tokio::test]

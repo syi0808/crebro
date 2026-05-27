@@ -24,6 +24,13 @@ trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 type BoxedStream = Box<dyn AsyncStream>;
 
+const DEFAULT_ALLOWLISTED_CONNECT_TARGETS: &[&str] = &[
+    "api.anthropic.com:443",
+    "api.openai.com:443",
+    "chatgpt.com:443",
+    "generativelanguage.googleapis.com:443",
+];
+
 #[derive(Clone)]
 pub struct ProxyConfig {
     pub listen_addr: String,
@@ -60,7 +67,10 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             listen_addr: "127.0.0.1:0".to_string(),
-            allowlisted_connect_targets: vec!["chatgpt.com:443".to_string()],
+            allowlisted_connect_targets: DEFAULT_ALLOWLISTED_CONNECT_TARGETS
+                .iter()
+                .map(|target| (*target).to_string())
+                .collect(),
             registry: Arc::new(RwLock::new(SecretRegistry::with_generated_keys())),
             patterns: CredentialPatternSet::builtin(),
             cache_entries: 4096,
