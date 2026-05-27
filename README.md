@@ -17,6 +17,7 @@ It starts a child-scoped local proxy, launches the child command with proxy and 
 The current implementation focuses on:
 
 - zero-config first
+- local request routing
 - in-memory secret handling
 - no persistent secret storage
 - environment and `.env` credential discovery
@@ -29,8 +30,9 @@ The current implementation focuses on:
 Crebro is not a full security boundary.
 
 - It does not protect against privileged memory inspection, kernel-level attackers, malicious local processes, or secrets that already exist in your shell, files, terminal, or child agent process.
-- It does not provide semantic detection for every possible secret-like value. current targets exact-match redaction of known, discovered, or explicitly declared secrets.
-- It does not install system-wide trust. Proxy mode uses a session-local CA for the wrapped child process.
+- It does not remove secrets or sensitive data already written to local conversation history, logs, caches, or other local files.
+- It does not provide semantic detection for every possible secret-like value. It currently targets exact-match redaction of known, discovered, or explicitly declared secrets.
+- It does not install system-wide trust. Crebro uses a session-local CA for the wrapped child process.
 - It does not claim full provider certification yet.
 - It does not replace normal secret hygiene, provider-side access controls, or outbound network monitoring.
 
@@ -95,15 +97,27 @@ crebro -- codex
 
 Crebro launches the child agent, keeps the child environment's normal auth settings, adds proxy and session CA variables, and exits with the child process status.
 
-### Proxy-Only Routing
+### Runtime Behavior
+
+On each run, Crebro:
+
+1. Discovers credential candidates from the current environment and the configured `.env` file.
+2. Starts a loopback explicit proxy and creates a session-local CA.
+3. Runs the child command with the existing environment plus proxy and CA variables.
+4. Leaves provider auth values in place so the child CLI can authenticate normally.
+5. Decrypts allowlisted HTTPS targets inside the proxy, redacts request bodies, forwards the request upstream, and restores Crebro placeholders in response bodies.
+
+The proxy variables include `HTTPS_PROXY`, `HTTP_PROXY`, lowercase proxy variants, `NODE_USE_ENV_PROXY`, and `CREBRO_PROXY_URL`. When a session CA is available, Crebro also sets common CA bundle variables such as `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, and `DENO_CERT`.
+
+### Request Routing
 
 ```sh
 crebro -- codex
 ```
 
-Crebro does not ask the user to choose a routing mode. The CLI always uses a child-scoped local proxy so auth-first agents such as Codex, Claude, Gemini, and OpenCode keep their normal login and API key behavior.
+Crebro routes supported child-agent HTTPS traffic through a child-scoped local proxy. Auth-first agents such as Codex, Claude, Gemini, and OpenCode keep their normal login and API key behavior.
 
-The proxy path starts a local explicit proxy, injects proxy environment variables into the child process, and uses a session-local CA for allowlisted MITM traffic. Provider API key and provider base URL environment variables remain available to the child; Crebro does not replace auth with placeholder keys.
+Crebro injects proxy environment variables into the child process and uses a session-local CA for allowlisted MITM traffic. Provider API key and provider base URL environment variables remain available to the child; Crebro does not replace auth with placeholder keys.
 
 ### Provider Auth Environment
 
@@ -213,9 +227,9 @@ Use this only in controlled testing. Delete the key log file after analysis.
 
 No. Crebro redacts known, discovered, or explicitly declared secrets before the upstream LLM request. It cannot protect against secrets already exposed to the child process, secrets not registered with Crebro, privileged local inspection, OS-level compromise, or an agent that sends data outside the routed path.
 
-### Does proxy mode decrypt my traffic?
+### Does Crebro decrypt my traffic?
 
-For allowlisted proxy targets, yes. Proxy mode uses local MITM so Crebro can redact request bodies and restore placeholders in responses. The CA is session-local and injected into the wrapped child process; Crebro does not install system-wide trust.
+For allowlisted targets, yes. Crebro uses local MITM so it can redact request bodies and restore placeholders in responses. The CA is session-local and injected into the wrapped child process; Crebro does not install system-wide trust.
 
 ### How was Crebro built?
 
