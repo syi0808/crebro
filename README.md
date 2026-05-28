@@ -241,17 +241,15 @@ crebro --tls-keylog-file /tmp/crebro-tls.keys -- codex
 
 Use this only in controlled testing. Delete the key log file after analysis.
 
-### Live Payload Monitor For QA
+### Live Payload Monitor
 
-For live terminal inspection of Crebro-to-provider payloads, use the tshark monitor helper:
+For live terminal inspection of Crebro-to-provider payloads, use the request tap monitor helper:
 
 ```sh
 scripts/chat-payload-monitor.sh -- codex
 ```
 
-The helper starts `tshark`, runs `crebro -- <child command>` with `CREBRO_TLS_KEYLOG_FILE`, pretty-prints decrypted JSON/SSE/WebSocket payloads with `jq`, and highlights Crebro placeholders such as `{{CREBRO_SECRET:...}}`. It keeps TLS key logs and tshark scratch files in a temporary directory and deletes them when the session exits.
-
-This is a controlled QA tool for inspecting upstream payloads. TLS key logs can decrypt captured traffic from the session, so do not keep or share them unless that is the explicit QA artifact you intend to preserve.
+The helper opens a `tmux` session instead of mixing the chat UI and payload stream in one terminal. The left pane runs `crebro -- <child command>`, and the right pane tails Crebro's sanitized upstream request tap, projecting only chat-related fields such as `messages`, `input`, `contents`, `prompt`, `system`, and `instructions`. It pretty-prints JSON payloads with `jq` and highlights Crebro placeholders such as `{{CREBRO_SECRET:...}}`. When the child exits, the tmux session closes and the temporary tap file is deleted.
 
 ## Frequently Asked Questions
 

@@ -4,7 +4,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    CrebroError, Result, redact::JsonSanitizer, restore::PlaceholderMatcher,
+    CrebroError, Result, payload_tap, redact::JsonSanitizer, restore::PlaceholderMatcher,
     secrets::SecretRegistry, stats::StatsRecorder,
 };
 
@@ -236,6 +236,7 @@ async fn sanitize_client_text(
         return match sanitizer.sanitize_json(payload, &mut registry) {
             Ok((sanitized, report)) => {
                 stats.record_sanitizer_report(&registry, &report);
+                payload_tap::append_websocket_request(&sanitized);
                 Ok(sanitized)
             }
             Err(err) => {
@@ -249,7 +250,9 @@ async fn sanitize_client_text(
     match sanitizer.sanitize_text_payload(text, &mut registry) {
         Ok((sanitized, report)) => {
             stats.record_sanitizer_report(&registry, &report);
-            Ok(sanitized.into_bytes())
+            let sanitized = sanitized.into_bytes();
+            payload_tap::append_websocket_request(&sanitized);
+            Ok(sanitized)
         }
         Err(err) => {
             stats.record_error(&err);

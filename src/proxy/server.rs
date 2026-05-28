@@ -17,6 +17,7 @@ use crate::{
     CrebroError, Result,
     gateway::tls::open_file_key_log,
     patterns::CredentialPatternSet,
+    payload_tap,
     redact::{JsonSanitizer, SanitizerReport},
     secrets::SecretRegistry,
     stats::StatsRecorder,
@@ -468,6 +469,7 @@ async fn sanitize_http_request(mut request: HttpHead, state: &ProxyState) -> Res
             }
         }
     };
+    payload_tap::append_http_request(head, &sanitized);
     if sanitized == body && !has_header(head, "accept-encoding") {
         return Ok(request.bytes);
     }

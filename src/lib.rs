@@ -4,6 +4,7 @@ pub mod gateway;
 pub mod hardening;
 pub mod logging;
 pub mod patterns;
+pub mod payload_tap;
 pub mod process;
 pub mod proxy;
 pub mod redact;
