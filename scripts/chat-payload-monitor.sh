@@ -4,11 +4,14 @@ set -u -o pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/chat-payload-monitor.sh [-- child-command ...]
+  scripts/chat-payload-monitor.sh -- <child-agent-command ...>
   scripts/chat-payload-monitor.sh --self-test
 
-Default child command:
-  codex
+Required child command examples:
+  scripts/chat-payload-monitor.sh -- claude
+  scripts/chat-payload-monitor.sh -- codex
+  scripts/chat-payload-monitor.sh -- gemini
+  scripts/chat-payload-monitor.sh -- opencode
 
 Environment overrides:
   CREBRO_MONITOR_SKIP_BUILD=1
@@ -59,10 +62,14 @@ if [[ "$MODE" == "child-pane" ]]; then
   CHILD_CMD=("$@")
 elif [[ "$MODE" == "monitor-pane" ]]; then
   CHILD_CMD=()
+elif [[ "$SELF_TEST" == "1" ]]; then
+  CHILD_CMD=()
 elif [[ "$#" -gt 0 ]]; then
   CHILD_CMD=("$@")
 else
-  CHILD_CMD=("codex")
+  echo "error: child agent command is required; pass it after --" >&2
+  usage >&2
+  exit 2
 fi
 
 require_tool() {

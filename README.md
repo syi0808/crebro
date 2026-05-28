@@ -6,10 +6,13 @@ Crebro is a local credential broker for coding agents that keeps secrets out of 
 
 Credentials should stay local. Crebro's position is that API keys, tokens, passwords, and manually marked secrets should not be sent to an external LLM just because they appeared in a prompt, config file, environment variable, or tool context.
 
-Crebro runs as a one-shot wrapper around a child agent process:
+Crebro runs as a one-shot wrapper around the child agent process you choose:
 
 ```sh
+crebro -- claude
 crebro -- codex
+crebro -- gemini
+crebro -- opencode
 ```
 
 It starts a child-scoped local proxy, launches the child command with proxy and session CA environment variables, redacts discovered secrets before supported provider traffic reaches the upstream LLM provider, and restores Crebro placeholders in the local response stream before the child agent sees the answer.
@@ -38,7 +41,7 @@ Crebro is not a full security boundary.
 
 ## Test
 
-Crebro is intended to protect coding-agent traffic broadly. The first tested scope is Codex.
+Crebro is intended to protect coding-agent traffic broadly. The current checked-in manual QA evidence is from a Codex run, and the runtime and sanitizing paths are documented for Codex, Claude, Gemini, and OpenCode.
 
 Verified local routing surfaces:
 
@@ -92,10 +95,13 @@ crebro --help
 ### Basic Agent Wrapper
 
 ```sh
+crebro -- claude
 crebro -- codex
+crebro -- gemini
+crebro -- opencode
 ```
 
-Crebro launches the child agent, keeps the child environment's normal auth settings, adds proxy and session CA variables, and exits with the child process status.
+Crebro launches the child agent command you provide, keeps the child environment's normal auth settings, adds proxy and session CA variables, and exits with the child process status.
 
 ### Runtime Behavior
 
@@ -112,7 +118,10 @@ The proxy variables include `HTTPS_PROXY`, `HTTP_PROXY`, lowercase proxy variant
 ### Request Routing
 
 ```sh
+crebro -- claude
 crebro -- codex
+crebro -- gemini
+crebro -- opencode
 ```
 
 Crebro routes supported child-agent HTTPS traffic through a child-scoped local proxy. Auth-first agents such as Codex, Claude, Gemini, and OpenCode keep their normal login and API key behavior.
@@ -124,7 +133,9 @@ Crebro injects proxy environment variables into the child process and uses a ses
 API key users can keep using the provider variables expected by their child CLI:
 
 ```sh
-OPENAI_API_KEY=sk-example crebro -- codex
+OPENAI_API_KEY=sk-example crebro -- opencode
+ANTHROPIC_API_KEY=sk-ant-example crebro -- claude
+GEMINI_API_KEY=AIza-example crebro -- gemini
 ```
 
 Known provider key variables include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, and `OPENCODE_API_KEY`. Crebro discovers these values for redaction, but leaves them in the child environment so the child CLI can authenticate normally.
@@ -134,13 +145,13 @@ Known provider key variables include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `ANT
 By default, Crebro checks `.env` for credential candidates.
 
 ```sh
-crebro --env-file .env.local -- codex
+crebro --env-file .env.local -- claude
 ```
 
 or:
 
 ```sh
-CREBRO_ENV_FILE=.env.local crebro -- codex
+CREBRO_ENV_FILE=.env.local crebro -- gemini
 ```
 
 ### User-Declared Secrets
@@ -160,13 +171,13 @@ When Crebro redacts a request, it can add a short instruction asking the LLM to 
 Disable this behavior with:
 
 ```sh
-crebro --no-placeholder-guidance -- codex
+crebro --no-placeholder-guidance -- gemini
 ```
 
 or:
 
 ```sh
-CREBRO_NO_PLACEHOLDER_GUIDANCE=true crebro -- codex
+CREBRO_NO_PLACEHOLDER_GUIDANCE=true crebro -- opencode
 ```
 
 Redaction still runs when placeholder guidance is disabled.
@@ -178,13 +189,13 @@ Built-in discovery and detector rules live in `patterns/credentials.toml` and ar
 Use a custom rule file with:
 
 ```sh
-crebro --patterns-file ./patterns/credentials.toml -- codex
+crebro --patterns-file ./patterns/credentials.toml -- claude
 ```
 
 or:
 
 ```sh
-CREBRO_PATTERNS_FILE=./patterns/credentials.toml crebro -- codex
+CREBRO_PATTERNS_FILE=./patterns/credentials.toml crebro -- gemini
 ```
 
 Every configured credential pattern is treated as redactable. If request text matches a registered pattern, Crebro registers that exact match as a transient in-memory secret and forwards only a placeholder upstream.
@@ -194,13 +205,13 @@ Every configured credential pattern is treated as redactable. If request text ma
 When launched through the CLI, Crebro writes best-effort local stats to `~/.crebro/stats.json`.
 
 ```sh
-crebro --stats-dir /tmp/crebro-stats -- codex
+crebro --stats-dir /tmp/crebro-stats -- opencode
 ```
 
 or:
 
 ```sh
-CREBRO_STATS_DIR=/tmp/crebro-stats crebro -- codex
+CREBRO_STATS_DIR=/tmp/crebro-stats crebro -- claude
 ```
 
 The stats file stores counts by Crebro placeholder id and label, including labels created from credential pattern ids. It does not store raw secrets, raw prompts, or raw responses.
@@ -210,16 +221,20 @@ The stats file stores counts by Crebro placeholder id and label, including label
 Crebro can scan local agent conversation stores and replace handled credentials with random same-length values for safer sharing:
 
 ```sh
-crebro sanitize-conversations
+crebro sanitize-conversations --agent claude
+crebro sanitize-conversations --agent codex
+crebro sanitize-conversations --agent gemini
+crebro sanitize-conversations --agent opencode
+crebro sanitize-conversations --agent all
 ```
 
 The default mode is a dry run. Add `--write` to create backups and rewrite changed records:
 
 ```sh
-crebro sanitize-conversations --write
+crebro sanitize-conversations --agent all --write
 ```
 
-Supported built-in targets cover Codex, Claude, Gemini, and OpenCode conversation stores. Use `--agent codex`, `--agent claude`, `--agent gemini`, or `--agent opencode` to narrow the scan, and repeat `--path <file-or-dir>` for extra targets. Backups default to `~/.crebro/backups/conversations/<timestamp>/`; pass `--backup-dir <path>` to choose another location.
+Supported built-in targets cover Codex, Claude, Gemini, and OpenCode conversation stores. Pass `--agent codex`, `--agent claude`, `--agent gemini`, or `--agent opencode` to choose specific targets, or pass `--agent all` to explicitly scan every built-in target. Repeat `--path <file-or-dir>` for extra targets. Backups default to `~/.crebro/backups/conversations/<timestamp>/`; pass `--backup-dir <path>` to choose another location.
 
 The command uses the same `.env`, environment, and credential pattern rules as proxy redaction. It replaces discovered credentials, `<cb>...</cb>` values found in histories, and registered credential pattern matches. It does not scrub agent auth/config files unless they are under an explicitly included conversation target. Binary protobuf files only support exact replacement of already registered secrets; pattern-only binary matches are reported as unsupported.
 
@@ -230,13 +245,13 @@ Use `--json` for a machine-readable report and `--strict` to fail when unsupport
 For isolated QA sessions, Crebro can write TLS key logs for its upstream HTTPS connections:
 
 ```sh
-CREBRO_TLS_KEYLOG_FILE=/tmp/crebro-tls.keys crebro -- codex
+CREBRO_TLS_KEYLOG_FILE=/tmp/crebro-tls.keys crebro -- claude
 ```
 
 or:
 
 ```sh
-crebro --tls-keylog-file /tmp/crebro-tls.keys -- codex
+crebro --tls-keylog-file /tmp/crebro-tls.keys -- opencode
 ```
 
 Use this only in controlled testing. Delete the key log file after analysis.
@@ -246,7 +261,10 @@ Use this only in controlled testing. Delete the key log file after analysis.
 For live terminal inspection of Crebro-to-provider payloads, use the request tap monitor helper:
 
 ```sh
+scripts/chat-payload-monitor.sh -- claude
 scripts/chat-payload-monitor.sh -- codex
+scripts/chat-payload-monitor.sh -- gemini
+scripts/chat-payload-monitor.sh -- opencode
 ```
 
 The helper opens a `tmux` session instead of mixing the chat UI and payload stream in one terminal. The left pane runs `crebro -- <child command>`, and the right pane tails Crebro's sanitized upstream request tap, projecting only chat-related fields such as `messages`, `input`, `contents`, `prompt`, `system`, and `instructions`. It pretty-prints JSON payloads with `jq` and highlights Crebro placeholders such as `{{CREBRO_SECRET:...}}`. When the child exits, the tmux session closes and the temporary tap file is deleted.

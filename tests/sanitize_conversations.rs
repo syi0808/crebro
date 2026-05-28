@@ -5,7 +5,7 @@ use std::{
 
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use crebro::{
-    cli::{Cli, SanitizeConversationsCli},
+    cli::{Cli, SanitizeAgentArg, SanitizeConversationsCli},
     patterns::CredentialPatternSet,
     sanitize::{SanitizeConfig, run_sanitize_conversations},
 };
@@ -183,8 +183,8 @@ fn binary_files_use_exact_registered_secret_replacement_only() {
 
 #[test]
 fn cli_parsing_keeps_legacy_wrapper_and_exposes_sanitize_help() {
-    let legacy = Cli::try_parse_from(["crebro", "--", "codex"]).unwrap();
-    assert_eq!(legacy.command, vec!["codex".to_string()]);
+    let legacy = Cli::try_parse_from(["crebro", "--", "claude"]).unwrap();
+    assert_eq!(legacy.command, vec!["claude".to_string()]);
 
     let sanitize = SanitizeConversationsCli::try_parse_from([
         "crebro sanitize-conversations",
@@ -197,6 +197,20 @@ fn cli_parsing_keeps_legacy_wrapper_and_exposes_sanitize_help() {
     .unwrap();
     assert!(sanitize.json);
     assert_eq!(sanitize.path, vec![PathBuf::from("/tmp/example")]);
+
+    let all = SanitizeConversationsCli::try_parse_from([
+        "crebro sanitize-conversations",
+        "--agent",
+        "all",
+    ])
+    .unwrap();
+    assert_eq!(all.agent, vec![SanitizeAgentArg::All]);
+
+    let missing_agent = SanitizeConversationsCli::try_parse_from(["crebro sanitize-conversations"]);
+    assert_eq!(
+        missing_agent.unwrap_err().kind(),
+        ErrorKind::MissingRequiredArgument
+    );
 
     let help = SanitizeConversationsCli::command().try_get_matches_from(["crebro", "--help"]);
     assert_eq!(help.unwrap_err().kind(), ErrorKind::DisplayHelp);

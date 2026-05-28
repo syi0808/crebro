@@ -4,10 +4,13 @@ set -u -o pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/qa-tshark-e2e.sh [-- child-command ...]
+  scripts/qa-tshark-e2e.sh -- <child-agent-command ...>
 
-Default child command:
-  codex
+Required child command examples:
+  scripts/qa-tshark-e2e.sh -- claude
+  scripts/qa-tshark-e2e.sh -- codex
+  scripts/qa-tshark-e2e.sh -- gemini
+  scripts/qa-tshark-e2e.sh -- opencode
 
 Environment overrides:
   CREBRO_QA_HOST=chatgpt.com
@@ -39,7 +42,9 @@ fi
 if [[ "$#" -gt 0 ]]; then
   CHILD_CMD=("$@")
 else
-  CHILD_CMD=("codex")
+  echo "error: child agent command is required; pass it after --" >&2
+  usage >&2
+  exit 2
 fi
 
 if [[ "${#CHILD_CMD[@]}" -eq 0 ]]; then

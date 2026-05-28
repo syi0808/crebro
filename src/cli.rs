@@ -55,7 +55,7 @@ pub struct SanitizeConversationsCli {
     #[arg(long)]
     pub write: bool,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, required = true)]
     pub agent: Vec<SanitizeAgentArg>,
 
     #[arg(long)]
@@ -199,7 +199,7 @@ pub async fn run_with_cli(cli: Cli) -> Result<i32> {
 }
 
 fn sanitize_agents(args: Vec<SanitizeAgentArg>) -> Vec<SanitizeAgent> {
-    if args.is_empty() || args.contains(&SanitizeAgentArg::All) {
+    if args.contains(&SanitizeAgentArg::All) {
         return vec![
             SanitizeAgent::Codex,
             SanitizeAgent::Claude,
@@ -209,11 +209,34 @@ fn sanitize_agents(args: Vec<SanitizeAgentArg>) -> Vec<SanitizeAgent> {
     }
     args.into_iter()
         .map(|agent| match agent {
-            SanitizeAgentArg::All => SanitizeAgent::Codex,
+            SanitizeAgentArg::All => unreachable!("all is handled before individual mapping"),
             SanitizeAgentArg::Codex => SanitizeAgent::Codex,
             SanitizeAgentArg::Claude => SanitizeAgent::Claude,
             SanitizeAgentArg::Gemini => SanitizeAgent::Gemini,
             SanitizeAgentArg::Opencode => SanitizeAgent::Opencode,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_all_selects_every_supported_sanitize_agent() {
+        assert_eq!(
+            sanitize_agents(vec![SanitizeAgentArg::All]),
+            vec![
+                SanitizeAgent::Codex,
+                SanitizeAgent::Claude,
+                SanitizeAgent::Gemini,
+                SanitizeAgent::Opencode,
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_sanitize_agent_list_stays_empty_for_programmatic_callers() {
+        assert!(sanitize_agents(Vec::new()).is_empty());
+    }
 }
