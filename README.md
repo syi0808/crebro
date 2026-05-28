@@ -200,6 +200,22 @@ CREBRO_PATTERNS_FILE=./patterns/credentials.toml crebro -- gemini
 
 Every configured credential pattern is treated as redactable. If request text matches a registered pattern, Crebro registers that exact match as a transient in-memory secret and forwards only a placeholder upstream.
 
+### Pattern Coverage Check
+
+Use `detect-pattern` to check whether a single string is covered by Crebro's registered credential patterns without launching proxy mode or redacting anything:
+
+```sh
+crebro detect-pattern "sk-proj-example1234567890example1234567890"
+```
+
+The command exits `0` when at least one pattern matches and `1` when no pattern matches. Output includes counts and pattern ids, but not the supplied raw string or matched substring. Add `--quiet` for exit-code-only checks or `--json` for machine-readable pattern ids and byte spans.
+
+Custom pattern files use the same TOML format as proxy mode:
+
+```sh
+crebro detect-pattern --patterns-file ./custom-patterns.toml "CUSTOM_ABC123456"
+```
+
 ### Local Stats
 
 When launched through the CLI, Crebro writes best-effort local stats to `~/.crebro/stats.json`.

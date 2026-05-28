@@ -1,4 +1,4 @@
-use std::{ffi::OsString, sync::Arc};
+use std::{ffi::OsString, path::Path, sync::Arc};
 
 use clap::{Parser, ValueEnum};
 use tokio::sync::RwLock;
@@ -21,7 +21,7 @@ use crate::{
     author,
     version,
     about,
-    after_help = "Maintenance commands:\n  crebro sanitize-conversations [OPTIONS]    Replace credentials in local agent conversation stores"
+    after_help = "Maintenance commands:\n  crebro detect-pattern [OPTIONS] <TEXT>     Check whether text matches a credential pattern\n  crebro sanitize-conversations [OPTIONS]    Replace credentials in local agent conversation stores"
 )]
 pub struct Cli {
     #[arg(long, env = "CREBRO_LISTEN_ADDR", default_value = "127.0.0.1:0")]
@@ -77,6 +77,24 @@ pub struct SanitizeConversationsCli {
     pub strict: bool,
 }
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "detect-pattern",
+    about = "Check whether supplied text matches a Crebro credential pattern"
+)]
+pub struct DetectPatternCli {
+    #[arg(long, env = "CREBRO_PATTERNS_FILE")]
+    pub patterns_file: Option<std::path::PathBuf>,
+
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(long)]
+    pub quiet: bool,
+
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SanitizeAgentArg {
     All,
@@ -92,28 +110,40 @@ pub async fn run() -> Result<i32> {
 
 pub async fn run_from_args(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
     let args = args.into_iter().collect::<Vec<_>>();
-    if args
-        .get(1)
-        .and_then(|arg| arg.to_str())
-        .is_some_and(|arg| arg == "sanitize-conversations")
-    {
-        let mut subcommand_args = Vec::with_capacity(args.len().saturating_sub(1));
-        subcommand_args.push(OsString::from("crebro sanitize-conversations"));
-        subcommand_args.extend(args.into_iter().skip(2));
-        let cli = SanitizeConversationsCli::parse_from(subcommand_args);
-        return run_with_sanitize_cli(cli).await;
+    match args.get(1).and_then(|arg| arg.to_str()) {
+        Some("detect-pattern") => {
+            let cli = DetectPatternCli::parse_from(subcommand_args(&args, "crebro detect-pattern"));
+            return run_with_detect_pattern_cli(cli).await;
+        }
+        Some("sanitize-conversations") => {
+            let cli = SanitizeConversationsCli::parse_from(subcommand_args(
+                &args,
+                "crebro sanitize-conversations",
+            ));
+            return run_with_sanitize_cli(cli).await;
+        }
+        _ => {}
     }
 
     let cli = Cli::parse_from(args);
     run_with_cli(cli).await
 }
 
+pub async fn run_with_detect_pattern_cli(cli: DetectPatternCli) -> Result<i32> {
+    let patterns = load_credential_patterns(cli.patterns_file.as_deref())?;
+    let report = detect_pattern_report(&patterns, &cli.text);
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if !cli.quiet {
+        println!("{}", format_detect_pattern_human(&report));
+    }
+
+    Ok(if report.matched { 0 } else { 1 })
+}
+
 pub async fn run_with_sanitize_cli(cli: SanitizeConversationsCli) -> Result<i32> {
-    let patterns = if let Some(path) = &cli.patterns_file {
-        std::sync::Arc::new(CredentialPatternSet::from_path(path)?)
-    } else {
-        CredentialPatternSet::builtin()
-    };
+    let patterns = load_credential_patterns(cli.patterns_file.as_deref())?;
     let report = run_sanitize_conversations(SanitizeConfig {
         write: cli.write,
         agents: sanitize_agents(cli.agent),
@@ -155,11 +185,7 @@ pub async fn run_with_cli(cli: Cli) -> Result<i32> {
         tracing::warn!(operation = failure.operation, "process hardening degraded");
     }
 
-    let patterns = if let Some(path) = &cli.patterns_file {
-        std::sync::Arc::new(CredentialPatternSet::from_path(path)?)
-    } else {
-        CredentialPatternSet::builtin()
-    };
+    let patterns = load_credential_patterns(cli.patterns_file.as_deref())?;
 
     let mut registry = SecretRegistry::with_generated_keys();
     for candidate in discover_env_candidates_with_patterns(512, &patterns) {
@@ -198,6 +224,67 @@ pub async fn run_with_cli(cli: Cli) -> Result<i32> {
     }
 }
 
+fn subcommand_args(args: &[OsString], command_name: &str) -> Vec<OsString> {
+    let mut subcommand_args = Vec::with_capacity(args.len().saturating_sub(1));
+    subcommand_args.push(OsString::from(command_name));
+    subcommand_args.extend(args.iter().skip(2).cloned());
+    subcommand_args
+}
+
+fn load_credential_patterns(path: Option<&Path>) -> Result<Arc<CredentialPatternSet>> {
+    if let Some(path) = path {
+        Ok(Arc::new(CredentialPatternSet::from_path(path)?))
+    } else {
+        Ok(CredentialPatternSet::builtin())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+struct DetectPatternReport {
+    matched: bool,
+    matches: Vec<DetectPatternMatchReport>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+struct DetectPatternMatchReport {
+    pattern_id: String,
+    start: usize,
+    end: usize,
+}
+
+fn detect_pattern_report(patterns: &CredentialPatternSet, text: &str) -> DetectPatternReport {
+    let matches = patterns
+        .auto_redact_matches(text)
+        .into_iter()
+        .map(|matched| DetectPatternMatchReport {
+            pattern_id: matched.pattern_id,
+            start: matched.start,
+            end: matched.end,
+        })
+        .collect::<Vec<_>>();
+    DetectPatternReport {
+        matched: !matches.is_empty(),
+        matches,
+    }
+}
+
+fn format_detect_pattern_human(report: &DetectPatternReport) -> String {
+    if report.matches.is_empty() {
+        return "no credential pattern match".to_string();
+    }
+    let pattern_ids = report
+        .matches
+        .iter()
+        .map(|matched| matched.pattern_id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "matched {} credential pattern(s): {}",
+        report.matches.len(),
+        pattern_ids
+    )
+}
+
 fn sanitize_agents(args: Vec<SanitizeAgentArg>) -> Vec<SanitizeAgent> {
     if args.contains(&SanitizeAgentArg::All) {
         return vec![
@@ -221,6 +308,123 @@ fn sanitize_agents(args: Vec<SanitizeAgentArg>) -> Vec<SanitizeAgent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "crebro-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn detect_pattern_cli_parses_text_and_options() {
+        let cli = DetectPatternCli::try_parse_from([
+            "crebro detect-pattern",
+            "--json",
+            "--quiet",
+            "not-a-secret",
+        ])
+        .unwrap();
+
+        assert!(cli.json);
+        assert!(cli.quiet);
+        assert_eq!(cli.text, "not-a-secret");
+    }
+
+    #[tokio::test]
+    async fn detect_pattern_builtin_match_returns_success() {
+        let code = run_with_detect_pattern_cli(DetectPatternCli {
+            patterns_file: None,
+            json: false,
+            quiet: true,
+            text: "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(code, 0);
+    }
+
+    #[tokio::test]
+    async fn detect_pattern_dispatch_is_intercepted_before_wrapper_mode() {
+        let code = run_from_args([
+            OsString::from("crebro"),
+            OsString::from("detect-pattern"),
+            OsString::from("--quiet"),
+            OsString::from("sk-proj-abcdefghijklmnopqrstuvwxyz1234567890"),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(code, 0);
+    }
+
+    #[tokio::test]
+    async fn detect_pattern_nonmatch_returns_one() {
+        let code = run_with_detect_pattern_cli(DetectPatternCli {
+            patterns_file: None,
+            json: false,
+            quiet: true,
+            text: "not-a-secret".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(code, 1);
+    }
+
+    #[tokio::test]
+    async fn detect_pattern_uses_custom_pattern_file() {
+        let path = temp_path("detect-pattern.toml");
+        std::fs::write(
+            &path,
+            r#"
+[env]
+key_markers = ["KEY"]
+common_values = ["true"]
+min_value_len = 4
+min_entropy = 1.0
+
+[[credential_patterns]]
+id = "custom_token"
+regex = '''CUSTOM_[A-Za-z0-9]{8,}'''
+"#,
+        )
+        .unwrap();
+
+        let code = run_with_detect_pattern_cli(DetectPatternCli {
+            patterns_file: Some(path.clone()),
+            json: false,
+            quiet: true,
+            text: "CUSTOM_ABC123456".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(code, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn detect_pattern_report_excludes_raw_match_text() {
+        let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890";
+        let report = detect_pattern_report(&CredentialPatternSet::builtin(), secret);
+
+        assert!(report.matched);
+        assert_eq!(report.matches[0].pattern_id, "openai_modern_key");
+
+        let human = format_detect_pattern_human(&report);
+        assert!(human.contains("openai_modern_key"));
+        assert!(!human.contains(secret));
+
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("openai_modern_key"));
+        assert!(!json.contains(secret));
+    }
 
     #[test]
     fn explicit_all_selects_every_supported_sanitize_agent() {
