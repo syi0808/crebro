@@ -310,7 +310,7 @@ fn field_policy_processes_user_secret_directives_in_known_binary_fields() {
 }
 
 #[test]
-fn custom_credential_pattern_requires_explicit_secret() {
+fn custom_credential_pattern_without_action_auto_redacts() {
     let patterns = Arc::new(
         CredentialPatternSet::from_toml(
             r#"
@@ -323,7 +323,6 @@ min_entropy = 1.0
 [[credential_patterns]]
 id = "test_credential"
 regex = '''TESTCRED_[A-Za-z0-9]{8,}'''
-on_unregistered_match = "require_explicit_secret"
 "#,
         )
         .unwrap(),
@@ -334,12 +333,15 @@ on_unregistered_match = "require_explicit_secret"
         "messages": [{"role": "user", "content": "send TESTCRED_ABC123456"}]
     });
 
-    let err = sanitizer
+    let (out, report) = sanitizer
         .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
-        .unwrap_err();
+        .unwrap();
+    let out = String::from_utf8(out).unwrap();
 
-    assert!(err.to_string().contains("test_credential"));
-    assert!(!err.to_string().contains("TESTCRED_ABC123456"));
+    assert!(!out.contains("TESTCRED_ABC123456"));
+    assert!(out.contains("{{CREBRO_SECRET:v1:AUTO_TEST_CREDENTIAL:"));
+    assert!(!report.redacted_secret_ids.is_empty());
+    assert!(report.unregistered_pattern_ids.is_empty());
 }
 
 #[test]
@@ -361,9 +363,11 @@ fn user_secret_directive_satisfies_credential_pattern_detector() {
 }
 
 #[test]
-fn built_in_credential_patterns_auto_redact_common_provider_prefixes() {
+fn built_in_credential_patterns_redact_registered_matches() {
     let pypi_token = format!("pypi-{}", "A".repeat(85));
     let sendgrid_token = format!("SG.{}.{}", "A".repeat(22), "B".repeat(43));
+    let google_key = format!("AIza{}", "A".repeat(35));
+    let twilio_sid = format!("AC{}", "a".repeat(32));
     let cases = [
         (
             "github_fine_grained_pat",
@@ -422,6 +426,25 @@ fn built_in_credential_patterns_auto_redact_common_provider_prefixes() {
             "credentialed_database_url",
             "postgres://alice:supersecret1234@example.com/db".to_string(),
         ),
+        (
+            "cloudflare_api_credential_context",
+            "cloudflare api token abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN".to_string(),
+        ),
+        (
+            "openai_legacy_key",
+            "sk-abcdefghijklmnopqrstuvwxyz1234567890".to_string(),
+        ),
+        ("aws_access_key_id", "AKIA1234567890ABCDEF".to_string()),
+        (
+            "stripe_publishable_key",
+            "pk_live_abcdefghijklmnopqrstuvwxyz1234567890".to_string(),
+        ),
+        ("google_api_key", google_key),
+        (
+            "supabase_publishable_key",
+            "sb_publishable_abcdefghijklmnopqrstuvwxyz1234567890".to_string(),
+        ),
+        ("twilio_sid_identifier", twilio_sid),
     ];
 
     for (pattern_id, credential) in cases {
@@ -448,7 +471,7 @@ fn built_in_credential_patterns_auto_redact_common_provider_prefixes() {
 }
 
 #[test]
-fn built_in_suspicious_context_patterns_require_explicit_secret() {
+fn built_in_suspicious_context_patterns_auto_redact() {
     let mut registry = SecretRegistry::with_generated_keys();
     let mut sanitizer = JsonSanitizer::new(64);
     let credential = "cloudflare api token abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN";
@@ -456,13 +479,15 @@ fn built_in_suspicious_context_patterns_require_explicit_secret() {
         "messages": [{"role": "user", "content": format!("send {credential}")}]
     });
 
-    let err = sanitizer
+    let (out, report) = sanitizer
         .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
-        .unwrap_err();
-    let err_text = err.to_string();
+        .unwrap();
+    let out = String::from_utf8(out).unwrap();
 
-    assert!(err_text.contains("cloudflare_api_credential_context"));
-    assert!(!err_text.contains(credential));
+    assert!(!out.contains(credential));
+    assert!(out.contains("{{CREBRO_SECRET:v1:AUTO_CLOUDFLARE_API_CREDENTIAL_CONTEXT:"));
+    assert_eq!(report.redacted_secret_ids.len(), 1);
+    assert!(report.unregistered_pattern_ids.is_empty());
 }
 
 #[test]
@@ -602,51 +627,7 @@ fn built_in_structural_patterns_avoid_common_placeholders() {
 }
 
 #[test]
-fn built_in_allow_patterns_report_without_blocking() {
-    let google_key = format!("AIza{}", "A".repeat(35));
-    let twilio_sid = format!("AC{}", "a".repeat(32));
-    let cases = [
-        (
-            "openai_legacy_key",
-            "sk-abcdefghijklmnopqrstuvwxyz1234567890".to_string(),
-        ),
-        ("aws_access_key_id", "AKIA1234567890ABCDEF".to_string()),
-        (
-            "stripe_publishable_key",
-            "pk_live_abcdefghijklmnopqrstuvwxyz1234567890".to_string(),
-        ),
-        ("google_api_key", google_key),
-        (
-            "supabase_publishable_key",
-            "sb_publishable_abcdefghijklmnopqrstuvwxyz1234567890".to_string(),
-        ),
-        ("twilio_sid_identifier", twilio_sid),
-    ];
-
-    for (pattern_id, credential) in cases {
-        let mut registry = SecretRegistry::with_generated_keys();
-        let mut sanitizer = JsonSanitizer::new(64);
-        let payload = json!({
-            "messages": [{"role": "user", "content": format!("send {credential}")}]
-        });
-
-        let (out, report) = sanitizer
-            .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
-            .unwrap();
-
-        assert!(String::from_utf8_lossy(&out).contains(credential.as_str()));
-        assert!(
-            report
-                .unregistered_pattern_ids
-                .contains(&pattern_id.to_string()),
-            "missing allow report for {pattern_id}: {:?}",
-            report.unregistered_pattern_ids
-        );
-    }
-}
-
-#[test]
-fn allow_credential_pattern_reports_unregistered_match() {
+fn legacy_allow_credential_pattern_action_is_ignored_and_redacts() {
     let patterns = Arc::new(
         CredentialPatternSet::from_toml(
             r#"
@@ -673,12 +654,12 @@ on_unregistered_match = "allow"
     let (out, report) = sanitizer
         .sanitize_json(&serde_json::to_vec(&payload).unwrap(), &mut registry)
         .unwrap();
+    let out = String::from_utf8(out).unwrap();
 
-    assert!(String::from_utf8_lossy(&out).contains("ALLOWCRED_ABC123456"));
-    assert_eq!(
-        report.unregistered_pattern_ids,
-        vec!["allowed_test_credential".to_string()]
-    );
+    assert!(!out.contains("ALLOWCRED_ABC123456"));
+    assert!(out.contains("{{CREBRO_SECRET:v1:AUTO_ALLOWED_TEST_CREDENTIAL:"));
+    assert!(!report.redacted_secret_ids.is_empty());
+    assert!(report.unregistered_pattern_ids.is_empty());
 }
 
 #[test]

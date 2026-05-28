@@ -119,7 +119,7 @@ node --check npm/bin/crebro.js
 
 ## Credential Pattern Contributions
 
-Credential patterns are security-sensitive because they can redact user data, block requests, or allow suspicious text through. Built-in rules live in `patterns/credentials.toml` and are compiled into the binary.
+Credential patterns are security-sensitive because matching text is registered as a transient in-memory secret and replaced before it is forwarded. Built-in rules live in `patterns/credentials.toml` and are compiled into the binary.
 
 ### Issue Required Before Adding a Pattern
 
@@ -133,20 +133,15 @@ The issue should document:
 
 - The provider, product, protocol, or credential family.
 - Public documentation or references for the credential format.
-- The proposed `on_unregistered_match` behavior.
 - Safe synthetic positive examples.
 - Likely false positives and examples that must not match.
-- Whether the pattern should redact automatically, require explicit `<cb>...</cb>` registration, or only report an allowed match.
+- The expected redaction impact, including whether any matched values are intentionally public but still worth hiding from upstream LLM requests.
 
 Do not include real credentials in the issue, pull request, tests, screenshots, packet captures, or logs.
 
 ### Pattern Behavior
 
-Use the narrowest behavior that protects users without overmatching:
-
-- `auto_redact`: Use only for high-confidence secret values where matching text should be registered as a transient in-memory secret and replaced before forwarding.
-- `require_explicit_secret`: Use for suspicious but ambiguous credential-like context where Crebro should block until the user explicitly wraps the value with `<cb>...</cb>`.
-- `allow`: Use for identifiers, client-visible keys, or ambiguous values that should be tracked in reports or stats without redaction or blocking.
+Use the narrowest regex that protects users without overmatching. Every accepted credential pattern redacts automatically, including identifier-like or client-visible values, because Crebro's default stance is that suspicious credential-shaped text should not be sent to an upstream LLM as raw text.
 
 ### Implementation Checklist
 

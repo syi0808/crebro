@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::{
     CrebroError, Result,
-    patterns::{CredentialPatternSet, OnUnregisteredMatch},
+    patterns::CredentialPatternSet,
     secrets::{SecretId, SecretLabel, SecretRegistry, SecureBuf},
 };
 
@@ -317,7 +317,7 @@ impl JsonSanitizer {
         decoded: &str,
         registry: &mut SecretRegistry,
         redacted_secret_ids: &mut Vec<SecretId>,
-        unregistered_pattern_ids: &mut Vec<String>,
+        _unregistered_pattern_ids: &mut Vec<String>,
     ) -> Result<String> {
         if let Some(sanitized) =
             replace_user_secret_directives_with(decoded, registry, |text, registry| {
@@ -341,15 +341,11 @@ impl JsonSanitizer {
             } else {
                 sanitized.text
             };
-            let pattern_ids = self.inspect_unregistered_patterns(&sanitized_text)?;
-            unregistered_pattern_ids.extend(pattern_ids);
             return Ok(sanitized_text);
         }
 
         self.auto_register_pattern_matches(decoded, registry)?;
         if registry.is_empty() {
-            let pattern_ids = self.inspect_unregistered_patterns(decoded)?;
-            unregistered_pattern_ids.extend(pattern_ids);
             return Ok(decoded.to_string());
         }
 
@@ -360,8 +356,6 @@ impl JsonSanitizer {
         let text = String::from_utf8(sanitized.bytes).map_err(|_| {
             CrebroError::Redaction("sanitized JSON string is not valid UTF-8".into())
         })?;
-        let pattern_ids = self.inspect_unregistered_patterns(&text)?;
-        unregistered_pattern_ids.extend(pattern_ids);
         Ok(text)
     }
 
@@ -469,23 +463,6 @@ impl JsonSanitizer {
         }
         Ok(())
     }
-
-    fn inspect_unregistered_patterns(&self, text: &str) -> Result<Vec<String>> {
-        let matches = self.patterns.inspect_unregistered_text(text);
-        let mut allowed = Vec::new();
-        for pattern_match in matches {
-            match pattern_match.on_unregistered_match {
-                OnUnregisteredMatch::RequireExplicitSecret => {
-                    return Err(CrebroError::UnregisteredCredential {
-                        pattern_id: pattern_match.id,
-                    });
-                }
-                OnUnregisteredMatch::AutoRedact => {}
-                OnUnregisteredMatch::Allow => allowed.push(pattern_match.id),
-            }
-        }
-        Ok(allowed)
-    }
 }
 
 fn sanitize_value_with_cache(
@@ -576,13 +553,11 @@ fn sanitize_decoded_string_with_cache(
         } else {
             sanitized.text
         };
-        inspect_patterns(patterns, &sanitized_text, report)?;
         return Ok(sanitized_text);
     }
 
     auto_register_pattern_matches(patterns, decoded, registry)?;
     if registry.is_empty() {
-        inspect_patterns(patterns, decoded, report)?;
         return Ok(decoded.to_string());
     }
 
@@ -592,7 +567,6 @@ fn sanitize_decoded_string_with_cache(
         .extend(sanitized.redacted_secret_ids.iter().copied());
     let text = String::from_utf8(sanitized.bytes)
         .map_err(|_| CrebroError::Redaction("sanitized JSON string is not valid UTF-8".into()))?;
-    inspect_patterns(patterns, &text, report)?;
     Ok(text)
 }
 
@@ -646,25 +620,6 @@ fn replace_user_secret_directives_with(
         CrebroError::Redaction("sanitized directive string is not valid UTF-8".into())
     })?;
     Ok(Some(DirectiveText { text, secret_ids }))
-}
-
-fn inspect_patterns(
-    patterns: &CredentialPatternSet,
-    text: &str,
-    report: &mut SanitizerReport,
-) -> Result<()> {
-    for pattern_match in patterns.inspect_unregistered_text(text) {
-        match pattern_match.on_unregistered_match {
-            OnUnregisteredMatch::RequireExplicitSecret => {
-                return Err(CrebroError::UnregisteredCredential {
-                    pattern_id: pattern_match.id,
-                });
-            }
-            OnUnregisteredMatch::AutoRedact => {}
-            OnUnregisteredMatch::Allow => report.unregistered_pattern_ids.push(pattern_match.id),
-        }
-    }
-    Ok(())
 }
 
 fn auto_register_pattern_matches(

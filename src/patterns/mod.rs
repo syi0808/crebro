@@ -33,7 +33,6 @@ pub struct CompiledCredentialPattern {
     id: String,
     description: Option<String>,
     regex: Regex,
-    on_unregistered_match: OnUnregisteredMatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -79,7 +78,6 @@ struct RawCredentialPattern {
     id: String,
     description: Option<String>,
     regex: String,
-    on_unregistered_match: OnUnregisteredMatch,
 }
 
 impl CredentialPatternSet {
@@ -109,28 +107,13 @@ impl CredentialPatternSet {
     }
 
     pub fn inspect_unregistered_text(&self, text: &str) -> Vec<CredentialPatternMatch> {
-        let mut matches = Vec::new();
-        let mut seen = HashSet::new();
-        for pattern in &self.credential_patterns {
-            if pattern.on_unregistered_match == OnUnregisteredMatch::AutoRedact {
-                continue;
-            }
-            if pattern.regex.is_match(text) && seen.insert(pattern.id.clone()) {
-                matches.push(CredentialPatternMatch {
-                    id: pattern.id.clone(),
-                    on_unregistered_match: pattern.on_unregistered_match,
-                });
-            }
-        }
-        matches
+        let _ = text;
+        Vec::new()
     }
 
     pub fn auto_redact_matches(&self, text: &str) -> Vec<CredentialAutoRedactMatch> {
         let mut matches = Vec::new();
         for pattern in &self.credential_patterns {
-            if pattern.on_unregistered_match != OnUnregisteredMatch::AutoRedact {
-                continue;
-            }
             for matched in pattern.regex.find_iter(text) {
                 matches.push(CredentialAutoRedactMatch {
                     pattern_id: pattern.id.clone(),
@@ -198,7 +181,6 @@ impl RawPatternFile {
                 id: raw.id,
                 description: raw.description,
                 regex,
-                on_unregistered_match: raw.on_unregistered_match,
             });
         }
         Ok(CredentialPatternSet {
@@ -275,10 +257,6 @@ impl CompiledCredentialPattern {
 
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
-    }
-
-    pub fn on_unregistered_match(&self) -> OnUnregisteredMatch {
-        self.on_unregistered_match
     }
 }
 

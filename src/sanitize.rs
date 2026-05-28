@@ -272,21 +272,8 @@ impl ConversationSanitizer {
         text: &str,
         strict: bool,
     ) -> Result<Vec<UnregisteredPattern>> {
-        let mut patterns = Vec::new();
-        for pattern_match in self.patterns.inspect_unregistered_text(text) {
-            if strict
-                && pattern_match.on_unregistered_match == OnUnregisteredMatch::RequireExplicitSecret
-            {
-                return Err(CrebroError::UnregisteredCredential {
-                    pattern_id: pattern_match.id,
-                });
-            }
-            patterns.push(UnregisteredPattern {
-                pattern_id: pattern_match.id,
-                action: pattern_match.on_unregistered_match,
-            });
-        }
-        Ok(patterns)
+        let _ = (text, strict);
+        Ok(Vec::new())
     }
 
     fn apply_replacement_spans(
@@ -1020,6 +1007,21 @@ mod tests {
         assert!(!result.text.contains(secret));
         assert!(!result.text.contains("CREBRO_SECRET"));
         assert_eq!(result.redactions, 1);
+        assert_eq!(result.text.trim_start_matches("send ").len(), secret.len());
+    }
+
+    #[test]
+    fn registered_identifier_patterns_are_replaced_with_random_values() {
+        let mut engine = engine();
+        let secret = "AKIA1234567890ABCDEF";
+        let result = engine
+            .sanitize_text(&format!("send {secret}"), true)
+            .unwrap();
+
+        assert!(!result.text.contains(secret));
+        assert!(!result.text.contains("CREBRO_SECRET"));
+        assert_eq!(result.redactions, 1);
+        assert!(result.unregistered_patterns.is_empty());
         assert_eq!(result.text.trim_start_matches("send ").len(), secret.len());
     }
 }

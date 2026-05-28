@@ -381,7 +381,7 @@ async fn gateway_records_redaction_stats_without_raw_secret() {
 }
 
 #[tokio::test]
-async fn gateway_records_unregistered_pattern_stats_on_reject() {
+async fn gateway_redacts_pattern_match_before_upstream() {
     let registry = SecretRegistry::with_generated_keys();
     let stats_dir = unique_temp_dir("pattern-stats");
     let stats_path = stats_dir.join("stats.json");
@@ -411,14 +411,20 @@ async fn gateway_records_unregistered_pattern_stats_on_reject() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response.status().is_success());
     tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(bodies.lock().await.is_empty());
+    let upstream_bodies = bodies.lock().await;
+    assert_eq!(upstream_bodies.len(), 1);
+    let upstream_body = String::from_utf8_lossy(&upstream_bodies[0]);
+    assert!(!upstream_body.contains(secret));
+    assert!(upstream_body.contains("{{CREBRO_SECRET:v1:AUTO_CLOUDFLARE_API_CREDENTIAL_CONTEXT:"));
+    drop(upstream_bodies);
+
     let stats = std::fs::read_to_string(&stats_path).unwrap();
-    assert!(stats.contains("cloudflare_api_credential_context"));
-    assert!(stats.contains("require_explicit_secret"));
+    assert!(stats.contains("AUTO_CLOUDFLARE_API_CREDENTIAL_CONTEXT"));
     assert!(stats.contains("\"count\": 1"));
     assert!(!stats.contains(secret));
+    assert!(!stats.contains("require_explicit_secret"));
 }
 
 #[tokio::test]
